@@ -17,7 +17,6 @@ import platform
 import sys
 import select
 import ctypes
-import json
 from typing import Union
 
 # POSIX
@@ -34,6 +33,10 @@ try:
     from ctypes import wintypes
 except (ImportError, AttributeError):
     pass
+
+# The run action will upload any ROM with application assets.
+# These are reserved system assets which won't trigger the upload.
+RESERVED_ASSETS = {"help", "icon"}
 
 # Rename this file for use on other platforms.
 SCRIPT_FILE = os.path.basename(__file__)
@@ -183,11 +186,12 @@ class SerialPort:
         if self._is_posix:
             total_written = 0
             while total_written < len(data):
-                try:
-                    written = os.write(self._fd, data[total_written:])
-                    total_written += written
-                except BlockingIOError:
-                    select.select([], [self._fd], [])
+                # Wait for device to be ready for writing
+                _, ready_to_write, _ = select.select([], [self._fd], [], RESPONSE_TIMEOUT)
+                if not ready_to_write:
+                    raise TimeoutError("Timeout: device not ready for writing")
+                written = os.write(self._fd, data[total_written:])
+                total_written += written
         else:
             written = wintypes.DWORD()
             buffer = ctypes.create_string_buffer(bytes(data))
@@ -257,10 +261,17 @@ class SerialPort:
         duration = 0.1  # works down to 300bps
         if self._is_posix:
             try:
-                fcntl.ioctl(self._fd, 0x5427)  # TIOCSBRK
-                time.sleep(duration)
-            finally:
-                fcntl.ioctl(self._fd, 0x5428)  # TIOCCBRK
+                # TIOCSBRK / TIOCCBRK for macOS are 0x2000747b / 0x2000747a
+                import fcntl
+                try:
+                    fcntl.ioctl(self._fd, 0x2000747b) # TIOCSBRK
+                    time.sleep(duration)
+                    fcntl.ioctl(self._fd, 0x2000747a) # TIOCCBRK
+                except Exception:
+                    # Fallback to standard POSIX break
+                    termios.tcsendbreak(self._fd, 0)
+            except Exception:
+                pass
         else:
             try:
                 kernel32.EscapeCommFunction(self._handle, 8)  # SETBREAK
@@ -292,7 +303,13 @@ class Console:
         if platform.system() == "Windows":
             return "COM1"
         elif platform.system() == "Darwin":
-            return "/dev/cu.usbmodem"
+            import glob
+
+            # Darwin (macOS) usbmodem devices. Prioritize tty over cu.
+            devices = sorted(glob.glob("/dev/tty.usbmodem*") + glob.glob("/dev/cu.usbmodem*"))
+            if devices:
+                return devices[0]
+            return "/dev/tty.usbmodem"
         elif platform.system() == "Linux":
             return "/dev/ttyACM0"
         else:
@@ -537,6 +554,11 @@ class Console:
         self.serial.write(b"\r")
         self.wait_for_prompt("]", timeout)
 
+    def reset(self):
+        """Start the 6502."""
+        self.serial.write(b"RESET\r")
+        self.serial.read_until()
+
     def binary(self, addr: int, data: bytes):
         """Send data to memory using BINARY command."""
         command = f"BINARY ${addr:04X} ${len(data):03X} ${binascii.crc32(data):08X}\r"
@@ -546,7 +568,7 @@ class Console:
 
     def upload(self, file, name: str):
         """Upload readable file to remote file "name"."""
-        self.serial.write(bytes(f"UPLOAD {json.dumps(name)}\r", "ascii"))
+        self.serial.write(bytes(f"UPLOAD {name}\r", "ascii"))
         self.wait_for_prompt("}")
         file.seek(0)
         while True:
@@ -559,16 +581,6 @@ class Console:
             self.wait_for_prompt("}")
         self.serial.write(b"END\r")
         self.wait_for_prompt("]")
-
-    def load(self, name: str):
-        """Load a previously uploaded ROM file."""
-        self.serial.write(f"LOAD {json.dumps(name)}\r".encode("ascii"))
-        self.serial.read_until()
-
-    def reset(self):
-        """Start the 6502."""
-        self.serial.write(b"RESET\r")
-        self.serial.read_until()
 
     def send_rom(self, rom):
         """Send rom."""
@@ -630,6 +642,10 @@ class ROM:
         if any(n == name for n, _ in self.assets):
             raise ROMException(f"Asset name already exists: {name}")
         self.assets.append((name, data))
+
+    def has_assets(self) -> bool:
+        """Returns true if there are non-reserved named assets."""
+        return any(n not in RESERVED_ASSETS for n, _ in self.assets)
 
     def add_binary_data(self, data: bytes, addr: int):
         """Add binary data to ROM."""
@@ -857,6 +873,14 @@ def exec_args():
         help=f"Configuration file for console connection.",
     )
     parser.add_argument(
+        "-t",
+        "--term",
+        dest="term",
+        metavar="bool",
+        default="True",
+        help=f"Attach to console terminal on run.",
+    )
+    parser.add_argument(
         "-d",
         "--device",
         dest="device",
@@ -872,33 +896,13 @@ def exec_args():
         default=argparse.SUPPRESS,
         help=argparse.SUPPRESS,
     )
-    parser.add_argument(
-        "-t",
-        "--term",
-        dest="term",
-        metavar="bool",
-        default="True",
-        help=f"Attach to console terminal on run.",
-    )
-    parser.add_argument(
-        "-w",
-        "--workdir",
-        dest="workdir",
-        metavar="dir",
-        default=None,
-        help="Remote directory to work in.",
-    )
     args = parser.parse_args()
 
     # Standard library configuration parser
     if args.config:
         config = configparser.ConfigParser()
         if not os.path.exists(args.config):
-            config[SCRIPT_NAME] = {
-                "device": args.device,
-                "term": args.term,
-                "workdir": args.workdir or "",
-            }
+            config[SCRIPT_NAME] = {"device": args.device, "term": args.term}
             with open(args.config, "w") as cfg:
                 config.write(cfg)
         else:
@@ -906,7 +910,6 @@ def exec_args():
         if config.has_section(SCRIPT_NAME):
             args.device = config[SCRIPT_NAME].get("device", args.device)
             args.term = config[SCRIPT_NAME].get("term", args.term)
-            args.workdir = config[SCRIPT_NAME].get("workdir", "") or None
 
     # Because parser is bad at bool
     if args.term.lower() in ["t", "true"] or (args.term.isdigit() and args.term != "0"):
@@ -943,8 +946,6 @@ def exec_args():
         print(f"[{SCRIPT_FILE}] Opening device {args.device}")
         console = Console(args.device)
         console.send_break()
-        if args.workdir:
-            console.command(f"CD {json.dumps(args.workdir)}")
 
     if args.command == "term":
         code_page = console.code_page()
@@ -956,11 +957,22 @@ def exec_args():
         print(f"[{SCRIPT_FILE}] Reading ROM {args.filename[0]}")
         rom = ROM()
         rom.add_rom_file(args.filename[0])
-        print(f"[{SCRIPT_FILE}] Uploading ROM")
-        with open(args.filename[0], "rb") as f:
-            console.upload(f, os.path.basename(args.filename[0]))
-        print(f"[{SCRIPT_FILE}] Loading ROM")
-        console.load(os.path.basename(args.filename[0]))
+        if rom.has_assets():
+            print(f"[{SCRIPT_FILE}] Uploading ROM (assets detected)")
+            with open(args.filename[0], "rb") as f:
+                console.upload(f, os.path.basename(args.filename[0]))
+            print(f"[{SCRIPT_FILE}] Loading ROM")
+            console.serial.write(
+                f"LOAD {os.path.basename(args.filename[0])}\r".encode("ascii")
+            )
+            console.serial.read_until()
+        else:
+            print(f"[{SCRIPT_FILE}] Sending ROM")
+            console.send_rom(rom)
+            if rom.has_reset_vector():
+                console.reset()
+            else:
+                print(f"[{SCRIPT_FILE}] No reset vector")
         if args.term:
             console.terminal(code_page)
 

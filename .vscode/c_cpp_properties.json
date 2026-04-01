@@ -1,0 +1,18 @@
+{
+    "version": 4,
+    "configurations": [
+        {
+            "name": "RP6502-Local",
+            "compilerPath": "/Users/rowe/Software/rp6502/llvm-mos/bin/mos-rp6502-clang",
+            "intelliSenseMode": "clang-x64",
+            "includePath": [
+                "/Users/rowe/Software/rp6502/llvm-mos/mos-platform/rp6502/include",
+                "/Users/rowe/Software/rp6502/llvm-mos/mos-platform/common/include",
+                "/Users/rowe/Software/rp6502/llvm-mos/lib/clang/23/include"
+            ],
+            "defines": [],
+            "cStandard": "c11",
+            "cppStandard": "c++17"
+        }
+    ]
+}

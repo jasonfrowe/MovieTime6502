@@ -1,0 +1,42 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "base-config",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "/Users/rowe/Software/rp6502/llvm-mos",
+        "LLVM_MOS_PLATFORM": "rp6502",
+        "Python3_FIND_VIRTUALENV": "FIRST",
+        "CMAKE_BUILD_TYPE": "MinSizeRel"
+      }
+    },
+    {
+      "name": "target-fpga",
+      "displayName": "FPGA OPL2",
+      "inherits": "base-config",
+      "cacheVariables": {
+        "USE_NATIVE_OPL2": "OFF"
+      }
+    },
+    {
+      "name": "target-native",
+      "displayName": "Native OPL2",
+      "inherits": "base-config",
+      "cacheVariables": {
+        "USE_NATIVE_OPL2": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-fpga",
+      "configurePreset": "target-fpga"
+    },
+    {
+      "name": "build-native",
+      "configurePreset": "target-native"
+    }
+  ]
+}
