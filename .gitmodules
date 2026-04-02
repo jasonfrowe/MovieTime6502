@@ -1,0 +1,3 @@
+[submodule "external/llvm-mos-sdk"]
+	path = external/llvm-mos-sdk
+	url = https://github.com/picocomputer/llvm-mos-sdk
