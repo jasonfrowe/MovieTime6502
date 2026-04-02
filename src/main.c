@@ -5,12 +5,12 @@
  * RP6502 VGA mode-2 tile renderer at the FPS encoded in the file header.
  *
  * Frame layout (18,848 bytes, fixed, matching encode_movie.py):
- *   32  bytes  palette1   (overlay layer, 16 × RGB555)
- *   32  bytes  palette2   (base layer,    16 × RGB555)
- *   8192 bytes tiles2     (256 tiles, base layer)
- *   8192 bytes tiles1     (256 tiles, overlay layer)
- *   1200 bytes map2       (40×30 tile IDs, base layer)
- *   1200 bytes map1       (40×30 tile IDs, overlay layer)
+ *   32   bytes  palette1   (base layer,    16 × RGB555)
+ *   32   bytes  palette2   (overlay layer, 16 × RGB555)
+ *   8192 bytes  tiles2     (256 tiles, overlay layer)
+ *   8192 bytes  tiles1     (256 tiles, base layer)
+ *   1200 bytes  map2       (40×30 tile IDs, overlay layer)
+ *   1200 bytes  map1       (40×30 tile IDs, base layer)
  */
 
 #include <rp6502.h>
@@ -58,9 +58,9 @@ static bool init_graphics(void)
     xram0_struct_set(tilemap1_cfg, vga_mode2_config_t, y_pos_px,      0);
     xram0_struct_set(tilemap1_cfg, vga_mode2_config_t, width_tiles,   WIDTH_TILES);
     xram0_struct_set(tilemap1_cfg, vga_mode2_config_t, height_tiles,  HEIGHT_TILES);
-    xram0_struct_set(tilemap1_cfg, vga_mode2_config_t, xram_data_ptr,    TILEMAP1_DATA);
-    xram0_struct_set(tilemap1_cfg, vga_mode2_config_t, xram_palette_ptr, PALETTE_ADDR1);
-    xram0_struct_set(tilemap1_cfg, vga_mode2_config_t, xram_tile_ptr,    TILES1_DATA);
+    xram0_struct_set(tilemap1_cfg, vga_mode2_config_t, xram_palette_ptr, (BUFFER0_BASE + OFFSET_PAL_BASE));
+    xram0_struct_set(tilemap1_cfg, vga_mode2_config_t, xram_tile_ptr,    (BUFFER0_BASE + OFFSET_TILES_BASE));
+    xram0_struct_set(tilemap1_cfg, vga_mode2_config_t, xram_data_ptr,    (BUFFER0_BASE + OFFSET_MAP_BASE));
     // Layer 1 (MIDDLE) = base background; always fully opaque.
     if (xreg_vga_mode(2, 0x02, tilemap1_cfg, 1, 0, 0) < 0) {
         puts("mode1 failed");
@@ -74,9 +74,9 @@ static bool init_graphics(void)
     xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, y_pos_px,      0);
     xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, width_tiles,   WIDTH_TILES);
     xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, height_tiles,  HEIGHT_TILES);
-    xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, xram_data_ptr,    TILEMAP2_DATA);
-    xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, xram_palette_ptr, PALETTE_ADDR2);
-    xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, xram_tile_ptr,    TILES2_DATA);
+    xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, xram_palette_ptr, (BUFFER0_BASE + OFFSET_PAL_OVERLAY));
+    xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, xram_tile_ptr,    (BUFFER0_BASE + OFFSET_TILES_OVERLAY));
+    xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, xram_data_ptr,    (BUFFER0_BASE + OFFSET_MAP_OVERLAY));
     // Layer 2 (TOP) = overlay; drawn over Layer 1; palette index 0 is transparent.
     if (xreg_vga_mode(2, 0x02, tilemap2_cfg, 2, 0, 0) < 0) {
         puts("mode2 failed");
@@ -85,40 +85,6 @@ static bool init_graphics(void)
 
     return true;
 }
-
-// ---------------------------------------------------------------------------
-// Palette writer — copies 32 bytes of RGB555 words into the XRAM palette slot
-// using RW0 for speed. Caller has already positioned RIA.addr0.
-// ---------------------------------------------------------------------------
-static void write_palette_raw(unsigned xram_addr, const unsigned char *data)
-{
-    int i;
-    RIA.addr0 = xram_addr;
-    RIA.step0 = 1;
-    for (i = 0; i < (int)PALETTE_SIZE; i++)
-        RIA.rw0 = data[i];
-}
-
-// ---------------------------------------------------------------------------
-// Frame apply — takes the raw 18,848-byte frame buffer and pushes each
-// section to XRAM. All writes use read_xram (already positioning the
-// destination address) or direct sequential writes via RW0.
-//
-// Section order in the frame buffer:
-//   [0]     palette1   32 bytes
-//   [32]    palette2   32 bytes
-//   [64]    tiles2     8192 bytes
-//   [8256]  tiles1     8192 bytes
-//   [16448] map2       1200 bytes
-//   [17648] map1       1200 bytes
-//
-// We read each section straight from the open file into XRAM using
-// read_xram() so there is no intermediate 6502 RAM buffer needed for
-// the large tile and map sections.
-// ---------------------------------------------------------------------------
-
-// Scratch buffer for palette data only (64 bytes — small, always in RAM)
-static unsigned char pal_buf[FRAME_PALETTE1_BYTES + FRAME_PALETTE2_BYTES];
 
 // ---------------------------------------------------------------------------
 // Debug layer view controls (compile-time)
@@ -133,15 +99,6 @@ static unsigned char pal_buf[FRAME_PALETTE1_BYTES + FRAME_PALETTE2_BYTES];
 #ifndef DEBUG_VIEW_MODE
 #define DEBUG_VIEW_MODE DEBUG_VIEW_NORMAL
 #endif
-
-static void fill_palette_word(unsigned char *dst, uint16_t word)
-{
-    int i;
-    for (i = 0; i < (FRAME_PALETTE1_BYTES / 2); i++) {
-        dst[i * 2]     = (unsigned char)(word & 0xFF);
-        dst[i * 2 + 1] = (unsigned char)((word >> 8) & 0xFF);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Cadence table for 24 fps presentation on a 60 Hz display.
@@ -282,49 +239,51 @@ int main(int argc, char *argv[])
     t_start      = clock();
     vsync_last   = RIA.vsync;
 
+    unsigned read_buffer = BUFFER0_BASE;
+    unsigned disp_buffer = BUFFER1_BASE;
+
     for (frame_idx = 0; frame_idx < frame_count; frame_idx++) {
 
-        // -- Read palette bytes into local RAM buffer ------------------------
-        n = read(fd, pal_buf, sizeof(pal_buf));
-        if (n != (int)sizeof(pal_buf)) break;
+        // -- Stream entire frame directly from USB → XRAM (18,848 bytes) -----
+        n = read_xram(read_buffer, FRAME_BYTES, fd);
+        if (n != FRAME_BYTES) break;
         bytes_read += n;
 
-        // -- Stream tiles2 directly from USB → XRAM (8192 bytes) ------------
-        n = read_xram(TILES2_DATA, FRAME_TILES2_BYTES, fd);
-        if (n != FRAME_TILES2_BYTES) break;
-        bytes_read += n;
-
-        // -- Stream tiles1 directly from USB → XRAM (8192 bytes) ------------
-        n = read_xram(TILES1_DATA, FRAME_TILES1_BYTES, fd);
-        if (n != FRAME_TILES1_BYTES) break;
-        bytes_read += n;
-
-        // -- Stream map2 directly from USB → XRAM (1200 bytes) --------------
-        n = read_xram(TILEMAP2_DATA, FRAME_MAP2_BYTES, fd);
-        if (n != FRAME_MAP2_BYTES) break;
-        bytes_read += n;
-
-        // -- Stream map1 directly from USB → XRAM (1200 bytes) --------------
-        n = read_xram(TILEMAP1_DATA, FRAME_MAP1_BYTES, fd);
-        if (n != FRAME_MAP1_BYTES) break;
-        bytes_read += n;
-
-        // -- Wait for vsync then apply palette and advance cadence -----------
-        // Check if we are already past our presentation vsync (late frame).
-        // We still display it rather than skip, but count the event.
+        // -- Wait for vsync then swap buffers and advance cadence -----------
         wait_vsync();
 
-        // Write palettes immediately after vsync for minimal tearing
+        disp_buffer = read_buffer;
+        read_buffer = (disp_buffer == BUFFER0_BASE) ? BUFFER1_BASE : BUFFER0_BASE;
+
+        // Apply new pointers immediately to live config structs
+        xram0_struct_set(tilemap1_cfg, vga_mode2_config_t, xram_palette_ptr, (disp_buffer + OFFSET_PAL_BASE));
+        xram0_struct_set(tilemap1_cfg, vga_mode2_config_t, xram_tile_ptr,    (disp_buffer + OFFSET_TILES_BASE));
+        xram0_struct_set(tilemap1_cfg, vga_mode2_config_t, xram_data_ptr,    (disp_buffer + OFFSET_MAP_BASE));
+
+        xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, xram_palette_ptr, (disp_buffer + OFFSET_PAL_OVERLAY));
+        xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, xram_tile_ptr,    (disp_buffer + OFFSET_TILES_OVERLAY));
+        xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, xram_data_ptr,    (disp_buffer + OFFSET_MAP_OVERLAY));
+
     #if DEBUG_VIEW_MODE == DEBUG_VIEW_BASE_ONLY
         // Force top overlay layer palette fully transparent.
-        fill_palette_word(pal_buf + FRAME_PALETTE1_BYTES, 0x0000);
+        {
+            int j;
+            RIA.addr0 = disp_buffer + OFFSET_PAL_OVERLAY;
+            RIA.step0 = 1;
+            for (j = 0; j < 32; j++) RIA.rw0 = 0x00;
+        }
     #elif DEBUG_VIEW_MODE == DEBUG_VIEW_OVERLAY_ONLY
         // Force middle base layer palette to opaque black.
-        fill_palette_word(pal_buf, 0x0020);
+        {
+            int j;
+            RIA.addr0 = disp_buffer + OFFSET_PAL_BASE;
+            RIA.step0 = 1;
+            for (j = 0; j < 16; j++) {
+                RIA.rw0 = 0x20; // LSB
+                RIA.rw0 = 0x00; // MSB
+            }
+        }
     #endif
-
-        write_palette_raw(PALETTE_ADDR1, pal_buf);
-        write_palette_raw(PALETTE_ADDR2, pal_buf + FRAME_PALETTE1_BYTES);
 
         // Hold for remaining vsyncs in the cadence slot
         {

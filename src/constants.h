@@ -16,41 +16,36 @@
 // ---------------------------------------------------------------------------
 // XRAM layout  (all addresses within the 64 KB XRAM window)
 //
-//   0x0000 – 0x04AF   map1      (40×30 = 1200 bytes, overlay layer)
-//   0x04B0 – 0x095F   map2      (40×30 = 1200 bytes, base layer)
-//   0x0960 – 0x295F   tiles1    (256 tiles × 32 bytes, overlay layer)
-//   0x2960 – 0x495F   tiles2    (256 tiles × 32 bytes, base layer)
-//   0x4960 – 0x496F   tilemap1 config  (vga_mode2_config_t, 20 bytes)
-//   0x4974 – 0x4987   tilemap2 config  (vga_mode2_config_t, 20 bytes)
-//   0xFC00 – 0xFC1F   palette1  (16 × 2 bytes RGB555, overlay)
-//   0xFC20 – 0xFC3F   palette2  (16 × 2 bytes RGB555, base)
+// MovieTime6502 uses full double buffering. 
+// Each frame buffer exactly matches the 18,848 byte MT62 file frame layout:
+//   [0]     palette1   32 bytes   (Base Layer)
+//   [32]    palette2   32 bytes   (Overlay Layer)
+//   [64]    tiles2     8192 bytes (Overlay Layer)
+//   [8256]  tiles1     8192 bytes (Base Layer)
+//   [16448] map2       1200 bytes (Overlay Layer)
+//   [17648] map1       1200 bytes (Base Layer)
+//
+//   0x0000 – 0x499F   Buffer 0
+//   0x49A0 – 0x933F   Buffer 1
+//   0x9340 – 0x9353   tilemap1 config  (vga_mode2_config_t, 20 bytes)
+//   0x9354 – 0x9367   tilemap2 config  (vga_mode2_config_t, 20 bytes)
 // ---------------------------------------------------------------------------
 
-// Tile-map data (40×30 byte ID arrays)
-#define TILEMAP1_DATA       0x0000U
-#define TILEMAP1_DATA_SIZE  0x04B0U   // 1200 bytes
+#define BUFFER0_BASE        0x0000U
+#define BUFFER1_BASE        0x49A0U
 
-#define TILEMAP2_DATA       (TILEMAP1_DATA + TILEMAP1_DATA_SIZE)
-#define TILEMAP2_DATA_SIZE  0x04B0U   // 1200 bytes
+// Offsets matching the contiguous binary frame chunk
+#define OFFSET_PAL_BASE      0U
+#define OFFSET_PAL_OVERLAY   32U
+#define OFFSET_TILES_OVERLAY 64U
+#define OFFSET_TILES_BASE    8256U
+#define OFFSET_MAP_OVERLAY   16448U
+#define OFFSET_MAP_BASE      17648U
 
-// Tile-image data (256 tiles × 32 bytes each)
-#define TILES1_DATA         (TILEMAP2_DATA + TILEMAP2_DATA_SIZE)
-#define TILES1_DATA_SIZE    0x2000U   // 8192 bytes
+#define TILEMAP1_CONFIG_ADDR 0x9340U
+#define TILEMAP2_CONFIG_ADDR 0x9354U
 
-#define TILES2_DATA         (TILES1_DATA + TILES1_DATA_SIZE)
-#define TILES2_DATA_SIZE    0x2000U   // 8192 bytes
-
-// End of streaming data — config structs placed here
-#define XRAM_DATA_END       (TILES2_DATA + TILES2_DATA_SIZE)   // 0x4960
-
-// vga_mode2_config_t is 20 bytes (sizeof verified at build time)
-#define TILEMAP1_CONFIG_ADDR    XRAM_DATA_END
-#define TILEMAP2_CONFIG_ADDR    (TILEMAP1_CONFIG_ADDR + 20U)
-
-// Palettes (fixed high-XRAM slots used by the VGA hardware)
-#define PALETTE_ADDR1   0xFC00U  // overlay layer — 16 × RGB555 = 32 bytes
-#define PALETTE_ADDR2   0xFC20U  // base layer    — 16 × RGB555 = 32 bytes
-#define PALETTE_SIZE    0x0020U  // 32 bytes per palette
+#define PALETTE_SIZE         32U
 
 // ---------------------------------------------------------------------------
 // MT62 movie stream format constants

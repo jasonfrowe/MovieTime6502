@@ -59,12 +59,6 @@ def palette_to_bytes(palette_rgb: np.ndarray, transparent_index0: bool = False) 
     return bytes(out)
 
 
-def stable_sort_palette(palette_rgb: np.ndarray) -> np.ndarray:
-    """Sort palette by brightness so index distance correlates with visual distance."""
-    luma = 0.299 * palette_rgb[:, 0] + 0.587 * palette_rgb[:, 1] + 0.114 * palette_rgb[:, 2]
-    return palette_rgb[np.argsort(luma)]
-
-
 def encode_tile(tile_8x8_idx: np.ndarray) -> bytes:
     out = bytearray(32)
     for row in range(TILE_H):
@@ -124,26 +118,11 @@ def find_tiles(indexed_img: np.ndarray, n_tiles: int) -> tuple[np.ndarray, np.nd
     return tile_dict, tile_map
 
 
-def encode_frame(frame_bgr: np.ndarray, prev_centers=None, prev_filtered_bgr=None) -> tuple[bytes, np.ndarray, np.ndarray]:
-    # 1. Stronger Spatial Denoise (reduces film grain, banding, and eases quantization)
-    filtered_bgr = cv2.bilateralFilter(frame_bgr, d=7, sigmaColor=50, sigmaSpace=50)
+def encode_frame(frame_bgr: np.ndarray, prev_centers=None) -> tuple[bytes, np.ndarray]:
+    # 1. Spatial Denoise (reduces film grain, banding, and eases quantization)
+    frame_bgr = cv2.bilateralFilter(frame_bgr, d=5, sigmaColor=35, sigmaSpace=35)
 
-    # 2. Temporal Denoise (Motion-aware blend for static regions)
-    if prev_filtered_bgr is not None:
-        curr_g = cv2.cvtColor(filtered_bgr, cv2.COLOR_BGR2GRAY)
-        prev_g = cv2.cvtColor(prev_filtered_bgr, cv2.COLOR_BGR2GRAY)
-        motion = cv2.absdiff(curr_g, prev_g).astype(np.float32)
-        
-        # Where motion is low (< 10), blend 60% of previous frame to kill shimmer
-        static_mask = (motion < 10.0).astype(np.float32)[:, :, None]
-        blended = filtered_bgr.astype(np.float32) * (1.0 - 0.6 * static_mask) + prev_filtered_bgr.astype(np.float32) * (0.6 * static_mask)
-        filtered_bgr = np.clip(np.round(blended), 0, 255).astype(np.uint8)
-
-    # 3. Dark Crush (force near-black to pure black to kill shadow noise)
-    luma = cv2.cvtColor(filtered_bgr, cv2.COLOR_BGR2GRAY)
-    filtered_bgr[luma < 12] = 0
-
-    frame_rgb = cv2.cvtColor(filtered_bgr, cv2.COLOR_BGR2RGB)
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     pixels = frame_rgb.reshape(-1, 3).astype(np.float32)
 
     # 2. Color Quantization with Temporal Stability (reduces frame-to-frame flicker)
@@ -153,33 +132,26 @@ def encode_frame(frame_bgr: np.ndarray, prev_centers=None, prev_filtered_bgr=Non
     raw_centers = km.cluster_centers_
     centers = raw_centers.clip(0, 255).astype(np.uint8)
 
-    # Sort by frequency so the most common colors form our base layer
-    counts = np.bincount(labels, minlength=32)
-    order = np.argsort(-counts)
-    
-    # Sort the palettes by luma so that the tile clustering math doesn't blow up
-    base_palette = stable_sort_palette(centers[order[:16]])
-    base_palette[0] = [0, 0, 0]  # Force stable black anchor
+    # Stable partition: sort all 32 colors by luma and split at the midpoint.
+    # Frequency-based sorting causes colors near the 16/17 boundary to swap
+    # between base and overlay every frame, which makes entire screen regions
+    # alternate between clean and noisy — the fundamental flicker bug.
+    # Luma sorting is deterministic from the color values alone, so the
+    # partition never oscillates.  It also leaves both palettes in luma order,
+    # which makes the index images smoother and tile clustering more stable.
+    luma_32 = 0.299 * centers[:, 0] + 0.587 * centers[:, 1] + 0.114 * centers[:, 2]
+    luma_order = np.argsort(luma_32)
+    base_palette = centers[luma_order[:16]]           # darkest 16 → base (opaque)
     overlay_palette = np.zeros((16, 3), dtype=np.uint8)
-    overlay_palette[1:] = stable_sort_palette(centers[order[16:31]])  # Index 0 is transparent
+    overlay_palette[1:] = centers[luma_order[16:31]]  # brightest 15 → overlay (idx 0 transparent)
 
     # 2. Base layer mapping (Layer 1)
     diff_base = frame_rgb.astype(np.int32)[:, :, None, :] - base_palette.astype(np.int32)[None, None, :, :]
     err_base = np.sum(diff_base**2, axis=3)
     base_img_idx = np.argmin(err_base, axis=2).astype(np.uint8)
-
-    # Eliminate isolated pixel noise before tile clustering
-    base_img_idx = cv2.medianBlur(base_img_idx, 3)
-
     best_err_base = np.take_along_axis(err_base, base_img_idx[:, :, None], axis=2)[:, :, 0]
 
     base_tiles, base_map = find_tiles(base_img_idx, NUM_TILES)
-
-    # Lock solid black blocks to a guaranteed pure black tile
-    black_tile_idx = int(np.argmin(np.sum(base_tiles.reshape(NUM_TILES, -1).astype(np.int32), axis=1)))
-    base_tiles[black_tile_idx] = 0
-    base_block_means = base_img_idx.reshape(ROWS, TILE_H, COLS, TILE_W).mean(axis=(1, 3))
-    base_map = np.where(base_block_means == 0, black_tile_idx, base_map).astype(np.uint8)
 
     # 3. Residual Generation for Layer 2
     diff_ov = frame_rgb.astype(np.int32)[:, :, None, :] - overlay_palette.astype(np.int32)[None, None, 1:, :]
@@ -197,12 +169,6 @@ def encode_frame(frame_bgr: np.ndarray, prev_centers=None, prev_filtered_bgr=Non
 
     overlay_tiles, overlay_map = find_tiles(overlay_img_idx, NUM_TILES)
 
-    # Lock solid transparent blocks to a guaranteed pure transparent tile
-    trans_tile_idx = int(np.argmin(np.sum(overlay_tiles.reshape(NUM_TILES, -1).astype(np.int32), axis=1)))
-    overlay_tiles[trans_tile_idx] = 0
-    ov_block_means = overlay_img_idx.reshape(ROWS, TILE_H, COLS, TILE_W).mean(axis=(1, 3))
-    overlay_map = np.where(ov_block_means == 0, trans_tile_idx, overlay_map).astype(np.uint8)
-
     # 4. Binary Packing (matching standard MovieTime6502 packing format exactly)
     pal1_bytes   = palette_to_bytes(base_palette)                            # base    -> Layer 1 slot
     pal2_bytes   = palette_to_bytes(overlay_palette, transparent_index0=True)# overlay -> Layer 2 slot
@@ -211,7 +177,7 @@ def encode_frame(frame_bgr: np.ndarray, prev_centers=None, prev_filtered_bgr=Non
     map2_bytes   = bytes(overlay_map.flatten())                              # overlay -> Layer 2 slot
     map1_bytes   = bytes(base_map.flatten())                                 # base    -> Layer 1 slot
 
-    return pal1_bytes + pal2_bytes + tiles2_bytes + tiles1_bytes + map2_bytes + map1_bytes, raw_centers, filtered_bgr
+    return pal1_bytes + pal2_bytes + tiles2_bytes + tiles1_bytes + map2_bytes + map1_bytes, raw_centers
 
 
 def main():
@@ -261,7 +227,6 @@ def main():
         current_bgr = None
         next_src_frame = start_src_frame
         prev_centers = None
-        prev_filtered_bgr = None
 
         t0 = time.time()
 
@@ -280,7 +245,7 @@ def main():
                 break
 
             bgr_cropped = resize_with_center_crop(current_bgr, SCREEN_W, SCREEN_H)
-            frame_data, prev_centers, prev_filtered_bgr = encode_frame(bgr_cropped, prev_centers, prev_filtered_bgr)
+            frame_data, prev_centers = encode_frame(bgr_cropped, prev_centers)
             fout.write(frame_data)
 
             elapsed = time.time() - t0
