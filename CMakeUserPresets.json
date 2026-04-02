@@ -6,7 +6,7 @@
       "hidden": true,
       "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
-        "CMAKE_PREFIX_PATH": "/Users/rowe/Software/rp6502/llvm-mos",
+        "CMAKE_PREFIX_PATH": "${sourceDir}/external/llvm-mos",
         "LLVM_MOS_PLATFORM": "rp6502",
         "Python3_FIND_VIRTUALENV": "FIRST",
         "CMAKE_BUILD_TYPE": "MinSizeRel"

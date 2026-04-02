@@ -3,6 +3,13 @@ cmake_minimum_required(VERSION 3.18)
 add_subdirectory(tools)
 
 set(LLVM_MOS_PLATFORM rp6502)
+# Prefer a locally installed SDK under external/llvm-mos.
+if(EXISTS "${CMAKE_SOURCE_DIR}/external/llvm-mos")
+    list(PREPEND CMAKE_PREFIX_PATH "${CMAKE_SOURCE_DIR}/external/llvm-mos")
+elseif(EXISTS "${CMAKE_SOURCE_DIR}/external/llvm-mos-sdk")
+    # Fallback to source tree config; requires mos compilers available in PATH.
+    list(PREPEND CMAKE_PREFIX_PATH "${CMAKE_SOURCE_DIR}/external/llvm-mos-sdk")
+endif()
 find_package(llvm-mos-sdk REQUIRED)
 
 project(MovieTime6502 C CXX ASM)

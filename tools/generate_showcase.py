@@ -131,6 +131,42 @@ def tunnel_bins(px: np.ndarray, py: np.ndarray, frame_idx: int) -> tuple[np.ndar
     return angle_bin, depth_bin, np.rint(brightness).astype(np.uint8)
 
 
+def tunnel_bins_v2(
+    px: np.ndarray, py: np.ndarray, frame_idx: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    phase = frame_idx * 0.05
+
+    # Lissajous-ish drift: amplitude-modulated so the camera breathes in/out
+    # rather than orbiting at a fixed radius.
+    cx = SCREEN_W * 0.5 + np.sin(phase * 0.40) * 40.0 * np.sin(phase * 0.10)
+    cy = SCREEN_H * 0.5 + np.cos(phase * 0.30) * 30.0 * np.cos(phase * 0.15)
+
+    dx, dy = px - cx, py - cy
+    # Slight ellipse makes the tunnel feel non-trivially round (like a real corridor).
+    radius = np.hypot(dx * 1.06, dy * 0.94) + 1.0
+
+    norm_angle = (np.arctan2(dy, dx) + np.pi) / (2.0 * np.pi)
+
+    # Perspective depth (geometric, i.e. how far into the tunnel this pixel is).
+    raw_depth = 500.0 / radius
+
+    # Scroll with a subtle speed pulse so the tunnel feels like it breathes in pace.
+    scroll = phase * 5.0 + np.sin(phase * 0.70) * 0.8
+    depth = raw_depth + scroll
+
+    # Twist tied to *geometric* depth (raw_depth % 16), not to scroll position.
+    # This keeps each ring of the tunnel permanently twisted — the spiral stays
+    # fixed as the camera flies through rather than winding faster over time.
+    twist = (raw_depth % 16.0) / 16.0 * 0.30   # up to ~1/3 rotation over depth
+    angle_bin = np.floor(((norm_angle + twist) % 1.0) * 16.0).astype(np.uint8)
+    depth_bin = np.floor(np.mod(depth, 16.0)).astype(np.uint8)
+
+    # Brightness: mid-radius walls are brightest; deep centre and screen edges dim.
+    brightness = np.clip(15.0 - radius / 14.0 + 3.0 * np.sin(raw_depth * 0.65), 0.0, 15.0)
+
+    return angle_bin, depth_bin, np.rint(brightness).astype(np.uint8)
+
+
 def generate_base_tiles(frame_idx: int) -> np.ndarray:
     x = np.arange(TILE_W, dtype=np.float32)[None, :]
     y = np.arange(TILE_H, dtype=np.float32)[:, None]
@@ -173,7 +209,7 @@ def generate_maps(frame_idx: int) -> tuple[np.ndarray, np.ndarray]:
     px = (np.arange(COLS, dtype=np.float32)[None, :] + 0.5) * TILE_W
     py = (np.arange(ROWS, dtype=np.float32)[:, None] + 0.5) * TILE_H
 
-    angle_bin, depth_bin, brightness = tunnel_bins(px, py, frame_idx)
+    angle_bin, depth_bin, brightness = tunnel_bins_v2(px, py, frame_idx)
     base_map = ((depth_bin << 4) | angle_bin).astype(np.uint8)
 
     phase = frame_idx * 0.08
@@ -201,12 +237,12 @@ def build_frame(frame_idx: int, fps: int) -> bytes:
     map2, map1 = generate_maps(frame_idx)
 
     return (
-        palette_to_bytes(palette1, transparent_index0=True)
-        + palette_to_bytes(palette2)
-        + build_tileset(tiles2)
-        + build_tileset(tiles1)
-        + bytes(map2.flatten())
-        + bytes(map1.flatten())
+        palette_to_bytes(palette2)                              # base palette    → Layer 1 slot (MIDDLE)
+        + palette_to_bytes(palette1, transparent_index0=True)  # overlay palette → Layer 2 slot (TOP)
+        + build_tileset(tiles1)                                # overlay tiles   → Layer 2 slot (TOP)
+        + build_tileset(tiles2)                                # base tiles      → Layer 1 slot (MIDDLE)
+        + bytes(map1.flatten())                                # overlay map     → Layer 2 slot (TOP)
+        + bytes(map2.flatten())                                # base map        → Layer 1 slot (MIDDLE)
     )
 
 

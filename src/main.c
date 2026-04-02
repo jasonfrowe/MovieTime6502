@@ -24,6 +24,16 @@
 #include <time.h>
 #include "constants.h"
 
+// Provide argv storage so RP6502 C runtime can populate argc/argv.
+// Without this hook, argc can be 0 even when launch arguments are supplied.
+void *argv_mem(size_t size)
+{
+    static unsigned char argv_storage[512];
+    if (size > sizeof(argv_storage))
+        return NULL;
+    return argv_storage;
+}
+
 // ---------------------------------------------------------------------------
 // VGA config addresses (written once at init into XRAM)
 // ---------------------------------------------------------------------------
@@ -51,7 +61,7 @@ static bool init_graphics(void)
     xram0_struct_set(tilemap1_cfg, vga_mode2_config_t, xram_data_ptr,    TILEMAP1_DATA);
     xram0_struct_set(tilemap1_cfg, vga_mode2_config_t, xram_palette_ptr, PALETTE_ADDR1);
     xram0_struct_set(tilemap1_cfg, vga_mode2_config_t, xram_tile_ptr,    TILES1_DATA);
-    // Plane 1 = overlay (drawn over plane 2)
+    // Layer 1 (MIDDLE) = base background; always fully opaque.
     if (xreg_vga_mode(2, 0x02, tilemap1_cfg, 1, 0, 0) < 0) {
         puts("mode1 failed");
         return false;
@@ -67,7 +77,7 @@ static bool init_graphics(void)
     xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, xram_data_ptr,    TILEMAP2_DATA);
     xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, xram_palette_ptr, PALETTE_ADDR2);
     xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, xram_tile_ptr,    TILES2_DATA);
-    // Plane 2 = base (background)
+    // Layer 2 (TOP) = overlay; drawn over Layer 1; palette index 0 is transparent.
     if (xreg_vga_mode(2, 0x02, tilemap2_cfg, 2, 0, 0) < 0) {
         puts("mode2 failed");
         return false;
@@ -143,6 +153,7 @@ static void wait_vsyncs(uint8_t n)
 int main(int argc, char *argv[])
 {
     int fd;
+    int i;
     uint8_t  header_fps;
     uint32_t frame_count;
     uint32_t frame_idx;
@@ -153,11 +164,37 @@ int main(int argc, char *argv[])
     uint32_t bytes_read;
     uint32_t late_frames;
     const char *filename;
+    const char *arg0;
+    size_t      arg0_len;
 
     printf("MovieTime6502\n");
 
-    // Get filename from command line, or default to SHOWCASE.BIN
-    filename = (argc > 1) ? argv[1] : "SHOWCASE.BIN";
+    // Debug: inspect argv provided by launcher/monitor.
+    printf("argc=%d\n", argc);
+    for (i = 0; i < argc; i++) {
+        printf("argv[%d]=%s\n", i, argv[i] ? argv[i] : "(null)");
+    }
+
+    // Get filename from command line, or default to SHOWCASE.BIN.
+    // Some launch paths may provide only one argv entry, so also accept
+    // argv[0] when it looks like a .BIN filename.
+    filename = "SHOWCASE.BIN";
+    if (argc > 1 && argv[1] != NULL && argv[1][0] != '\0') {
+        filename = argv[1];
+    } else if (argc > 0 && argv[0] != NULL && argv[0][0] != '\0') {
+        arg0 = argv[0];
+        arg0_len = strlen(arg0);
+        if (arg0_len >= 4) {
+            const char *ext = arg0 + (arg0_len - 4);
+            if (ext[0] == '.' &&
+                (ext[1] == 'B' || ext[1] == 'b') &&
+                (ext[2] == 'I' || ext[2] == 'i') &&
+                (ext[3] == 'N' || ext[3] == 'n'))
+            {
+                filename = arg0;
+            }
+        }
+    }
     printf("Playing: %s\n", filename);
 
     if (!init_graphics()) {

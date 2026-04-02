@@ -13,6 +13,17 @@ The runtime binary expects a file named MOVIE.BIN on the USB drive.
 
 ## Build
 
+Initialize the vendored SDK submodule once:
+
+git submodule update --init --recursive
+
+Build and install the SDK locally (one-time, creates external/llvm-mos):
+
+cmake -S external/llvm-mos-sdk -B external/llvm-mos-sdk/build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=$PWD/external/llvm-mos
+cmake --build external/llvm-mos-sdk/build --target install -j4
+
 1. Configure and build with CMake (or build from VS Code CMake Tools).
 2. The build output includes MovieTime6502.rp6502 in build/target-native.
 

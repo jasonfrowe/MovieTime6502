@@ -18,12 +18,14 @@ Header (18 bytes, all little-endian):
     4 bytes  frame_count
 
 Each frame (18,848 bytes, fixed size):
-    32 bytes  palette1   16 × RGB555 little-endian (layer 1 overlay)
-    32 bytes  palette2   16 × RGB555 little-endian (layer 2 base)
-    8192 bytes tiles2    256 tiles × 32 bytes (8×8 4-bit), base layer
-    8192 bytes tiles1    256 tiles × 32 bytes (8×8 4-bit), overlay layer
-    1200 bytes map2      40×30 tile-IDs, base layer
-    1200 bytes map1      40×30 tile-IDs, overlay layer
+    32 bytes  palette1   16 × RGB555 little-endian (Layer 1 = MIDDLE, base — all opaque)
+    32 bytes  palette2   16 × RGB555 little-endian (Layer 2 = TOP, overlay — index 0 transparent)
+    8192 bytes tiles2    256 tiles × 32 bytes (8×8 4-bit), overlay layer (Layer 2, TOP)
+    8192 bytes tiles1    256 tiles × 32 bytes (8×8 4-bit), base layer   (Layer 1, MIDDLE)
+    1200 bytes map2      40×30 tile-IDs, overlay layer (Layer 2, TOP)
+    1200 bytes map1      40×30 tile-IDs, base layer   (Layer 1, MIDDLE)
+
+Hardware layer stack (bottom → top): Layer 0 (unused) → Layer 1 (base) → Layer 2 (overlay).
 
 RGB555 encoding used by the RP6502 VGA:
     #define COLOR_FROM_RGB8(r,g,b) (((b>>3)<<11)|((g>>3)<<6)|(r>>3))
@@ -48,6 +50,7 @@ import os
 import struct
 import sys
 import time
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -111,6 +114,49 @@ def resize_with_center_crop(frame_bgr: np.ndarray, target_w: int, target_h: int)
     x = max(0, (scaled_w - target_w) // 2)
     y = max(0, (scaled_h - target_h) // 2)
     return resized[y:y + target_h, x:x + target_w]
+
+
+def preprocess_frame(
+    frame_bgr: np.ndarray,
+    prev_filtered_bgr: Optional[np.ndarray],
+    denoise_h: int,
+    sharpen: float,
+    temporal_strength: float,
+    motion_thresh: float,
+) -> np.ndarray:
+    """
+    Reduce film grain/shimmer before quantization while preserving motion edges.
+
+    Pipeline:
+      1) Luma denoise (non-local means) to suppress grain.
+      2) Mild unsharp mask to recover edge definition.
+      3) Motion-aware temporal blend for static regions only.
+    """
+    ycc = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YCrCb)
+    y = ycc[:, :, 0]
+
+    if denoise_h > 0:
+        y = cv2.fastNlMeansDenoising(y, None, float(denoise_h), 7, 21)
+
+    if sharpen > 0.0:
+        blur = cv2.GaussianBlur(y, (0, 0), sigmaX=1.0)
+        y = cv2.addWeighted(y, 1.0 + float(sharpen), blur, -float(sharpen), 0)
+
+    ycc[:, :, 0] = y
+    filtered = cv2.cvtColor(ycc, cv2.COLOR_YCrCb2BGR)
+
+    if prev_filtered_bgr is None or temporal_strength <= 0.0:
+        return filtered
+
+    # Blend only low-motion regions to reduce flicker without ghosting motion.
+    curr_g = cv2.cvtColor(filtered, cv2.COLOR_BGR2GRAY)
+    prev_g = cv2.cvtColor(prev_filtered_bgr, cv2.COLOR_BGR2GRAY)
+    motion = cv2.absdiff(curr_g, prev_g).astype(np.float32)
+    static_mask = (motion < float(motion_thresh)).astype(np.float32)[:, :, None]
+
+    alpha = np.clip(float(temporal_strength), 0.0, 0.95)
+    blended = filtered.astype(np.float32) * (1.0 - alpha * static_mask) + prev_filtered_bgr.astype(np.float32) * (alpha * static_mask)
+    return np.clip(np.round(blended), 0, 255).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -181,46 +227,74 @@ def find_tiles(indexed_img: np.ndarray, n_tiles: int) -> tuple[np.ndarray, np.nd
                          random_state=42, batch_size=512)
     km.fit(tiles_arr)
     tile_ids = km.predict(tiles_arr)
-    centres = km.cluster_centers_.clip(0, 15).round().astype(np.uint8)
-    tile_dict = centres.reshape(n_tiles, TILE_H, TILE_W)
+
+    # Use real observed tiles nearest each centroid (medoid-like), not rounded
+    # mean tiles. This avoids centroid blur/noise that causes shimmering.
+    centres = km.cluster_centers_.astype(np.float32)
+    tile_dict = np.zeros((n_tiles, TILE_H, TILE_W), dtype=np.uint8)
+    for k in range(n_tiles):
+        members = np.where(tile_ids == k)[0]
+        if members.size == 0:
+            tile_dict[k] = np.clip(np.round(centres[k].reshape(TILE_H, TILE_W)), 0, 15).astype(np.uint8)
+            continue
+        member_tiles = tiles_arr[members]
+        d2 = np.sum((member_tiles - centres[k]) ** 2, axis=1)
+        best_idx = members[int(np.argmin(d2))]
+        tile_dict[k] = tiles_arr[best_idx].reshape(TILE_H, TILE_W).astype(np.uint8)
+
     tile_map = tile_ids.reshape(ROWS, COLS).astype(np.uint8)
     return tile_dict, tile_map
 
 
-def encode_frame(frame_bgr: np.ndarray, prev_palette1=None, prev_palette2=None) -> bytes:
+def nearest_palette_indices(frame_rgb: np.ndarray, palette_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return nearest palette index and squared error per pixel for an RGB frame."""
+    # frame: (H, W, 3), palette: (N, 3)
+    # Use int32 here; int16 overflows when squaring channel deltas up to 255.
+    diff = frame_rgb[:, :, None, :].astype(np.int32) - palette_rgb[None, None, :, :].astype(np.int32)
+    err = np.sum(diff * diff, axis=3)  # (H, W, N)
+    idx = np.argmin(err, axis=2).astype(np.uint8)
+    best_err = np.take_along_axis(err, idx[:, :, None], axis=2)[:, :, 0]
+    return idx, best_err
+
+
+def encode_frame(frame_bgr: np.ndarray, prev_palette32=None) -> tuple[bytes, np.ndarray]:
     """
     Encode a single 320×240 BGR frame into FRAME_BYTES bytes.
     Strategy:
       1. Global 32-colour quantization → split into two 16-colour palettes.
-      2. Layer 2 (base): 256-tile dictionary from full quantized image.
-      3. Layer 1 (overlay): 256-tile dictionary from residual / correction image.
+      2. Layer 1 (MIDDLE / base): 256-tile dictionary from full quantized image.
+      3. Layer 2 (TOP / overlay): 256-tile dictionary; palette index 0 transparent.
+    Layer 2 is drawn on top of Layer 1; transparent pixels reveal the base below.
     """
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
     # ----- Step 1: 32-colour global palette --------------------------------
-    pal32, labels32 = quantize_frame(frame_rgb, TOTAL_COLOURS, palette_hint=None)
+    # Warm-start from previous frame to reduce palette jump/flicker.
+    pal32, labels32 = quantize_frame(frame_rgb, TOTAL_COLOURS, palette_hint=prev_palette32)
 
-    # Split by luminance. Base gets 16 visible colours. Overlay gets 15 visible
-    # colours plus palette index 0 reserved as transparent.
-    luma = 0.299 * pal32[:, 0] + 0.587 * pal32[:, 1] + 0.114 * pal32[:, 2]
-    order = np.argsort(luma)          # darkest → brightest
-    pal2_global_idx = order[:COLOURS]                   # 16 darker colours → base layer
-    pal1_global_idx = order[-VISIBLE_OVERLAY_COLOURS:]  # 15 brighter colours → overlay layer
+    # Split by usage so base contains the most common colours for this frame.
+    # Overlay gets secondary colours and is applied only where it improves fit.
+    counts = np.bincount(labels32.reshape(-1), minlength=TOTAL_COLOURS)
+    order = np.argsort(-counts)  # most used -> least used
+    pal2_global_idx = order[:COLOURS]
+    pal1_global_idx = order[COLOURS:COLOURS + VISIBLE_OVERLAY_COLOURS]
 
-    palette2_rgb = pal32[pal2_global_idx]   # (16, 3)
+    palette2_rgb = pal32[pal2_global_idx]   # (16, 3), always visible
     palette1_rgb = np.zeros((COLOURS, 3), dtype=np.uint8)
     palette1_rgb[1:] = pal32[pal1_global_idx]
 
-    # Remap labels32 → two local index spaces
-    remap2 = np.full(TOTAL_COLOURS, 0, np.uint8)
-    remap1 = np.full(TOTAL_COLOURS, 0, np.uint8)
-    for loc, glob in enumerate(pal2_global_idx):
-        remap2[glob] = loc
-    for loc, glob in enumerate(pal1_global_idx, start=1):
-        remap1[glob] = loc
+    # Base gets nearest colour for every pixel (never forced to index 0 black).
+    img2_idx, err2 = nearest_palette_indices(frame_rgb, palette2_rgb)
 
-    img2_idx = remap2[labels32]   # image quantized to palette2 indices (0-15)
-    img1_idx = remap1[labels32]   # image quantized to palette1 indices (0-15)
+    # Overlay candidate uses 15 visible entries (index 1..15), index 0 reserved transparent.
+    ov_idx_raw, err1 = nearest_palette_indices(frame_rgb, palette1_rgb[1:])
+    ov_idx = (ov_idx_raw + 1).astype(np.uint8)
+
+    # Only enable overlay where it materially improves colour error over base,
+    # and avoid overlay in very dark regions to suppress sparkly noise.
+    src_luma = (0.299 * frame_rgb[:, :, 0] + 0.587 * frame_rgb[:, :, 1] + 0.114 * frame_rgb[:, :, 2])
+    overlay_mask = (err1 * 10 < err2 * 7) & (src_luma > 20.0)  # ~30% better + dark gate
+    img1_idx = np.where(overlay_mask, ov_idx, 0).astype(np.uint8)
 
     # ----- Step 2: Base layer tile dictionary (256 tiles) -------------------
     tile_dict2, tile_map2 = find_tiles(img2_idx, NUM_TILES)
@@ -230,16 +304,18 @@ def encode_frame(frame_bgr: np.ndarray, prev_palette1=None, prev_palette2=None) 
     tile_dict1, tile_map1 = find_tiles(img1_idx, NUM_TILES)
 
     # ----- Pack the frame ---------------------------------------------------
-    pal1_bytes = palette_to_bytes(palette1_rgb, transparent_index0=True)   # 32 bytes
-    pal2_bytes = palette_to_bytes(palette2_rgb)   # 32 bytes
-    tiles2_bytes = build_tileset(list(tile_dict2))  # 8192 bytes
-    tiles1_bytes = build_tileset(list(tile_dict1))  # 8192 bytes
-    map2_bytes = bytes(tile_map2.flatten())       # 1200 bytes
-    map1_bytes = bytes(tile_map1.flatten())       # 1200 bytes
+    # Layer 1 (MIDDLE) slot ← base (fully opaque palette, base tiles/map)
+    # Layer 2 (TOP)    slot ← overlay (transparent index 0, overlay tiles/map)
+    pal1_bytes   = palette_to_bytes(palette2_rgb)                           # base   → Layer 1
+    pal2_bytes   = palette_to_bytes(palette1_rgb, transparent_index0=True)  # overlay→ Layer 2
+    tiles2_bytes = build_tileset(list(tile_dict1))  # overlay tiles → Layer 2 slot
+    tiles1_bytes = build_tileset(list(tile_dict2))  # base tiles    → Layer 1 slot
+    map2_bytes   = bytes(tile_map1.flatten())        # overlay map   → Layer 2 slot
+    map1_bytes   = bytes(tile_map2.flatten())        # base map      → Layer 1 slot
 
     frame_bytes = pal1_bytes + pal2_bytes + tiles2_bytes + tiles1_bytes + map2_bytes + map1_bytes
     assert len(frame_bytes) == FRAME_BYTES, f"Frame size mismatch: {len(frame_bytes)}"
-    return frame_bytes
+    return frame_bytes, pal32
 
 
 # ---------------------------------------------------------------------------
@@ -290,26 +366,26 @@ def reconstruct_frame(frame_bytes: bytes) -> np.ndarray:
     map2 = np.frombuffer(map2_data, np.uint8).reshape(ROWS, COLS)
     map1 = np.frombuffer(map1_data, np.uint8).reshape(ROWS, COLS)
 
-    # Layer 2 = base
+    # Layer 1 (MIDDLE) = base — paint all pixels first (pal1/tiles1/map1 slots)
     img = np.zeros((SCREEN_H, SCREEN_W, 3), np.uint8)
-    for r in range(ROWS):
-        for c in range(COLS):
-            tile = tiles2[map2[r, c]]
-            for tr in range(TILE_H):
-                for tc in range(TILE_W):
-                    idx = tile[tr, tc]
-                    rgb = pal2[idx][:3]
-                    img[r*TILE_H+tr, c*TILE_W+tc] = rgb
-
-    # Layer 1 = overlay (composited over base — non-zero index replaces base)
     for r in range(ROWS):
         for c in range(COLS):
             tile = tiles1[map1[r, c]]
             for tr in range(TILE_H):
                 for tc in range(TILE_W):
                     idx = tile[tr, tc]
-                    if pal1[idx][3]:
-                        rgb = pal1[idx][:3]
+                    rgb = pal1[idx][:3]
+                    img[r*TILE_H+tr, c*TILE_W+tc] = rgb
+
+    # Layer 2 (TOP) = overlay — composite over base; index 0 is transparent (pal2/tiles2/map2 slots)
+    for r in range(ROWS):
+        for c in range(COLS):
+            tile = tiles2[map2[r, c]]
+            for tr in range(TILE_H):
+                for tc in range(TILE_W):
+                    idx = tile[tr, tc]
+                    if pal2[idx][3]:
+                        rgb = pal2[idx][:3]
                         img[r*TILE_H+tr, c*TILE_W+tc] = rgb
 
     return img
@@ -319,7 +395,7 @@ def save_debug_frame(frame_idx: int, frame_bytes: bytes, debug_dir: str):
     """Save palette visualization and reconstructed frame PNG for inspection."""
     os.makedirs(debug_dir, exist_ok=True)
     recon = reconstruct_frame(frame_bytes)
-    img = Image.fromarray(recon, "RGB")
+    img = Image.fromarray(recon)
     img.save(os.path.join(debug_dir, f"frame_{frame_idx:04d}.png"))
 
 
@@ -342,7 +418,9 @@ def parse_time(ts: str) -> float:
 # ---------------------------------------------------------------------------
 
 def encode(input_path: str, start_ts: str, end_ts: str, output_path: str,
-           fps: int = 24, debug_dir: str = None, debug_every: int = 24):
+           fps: int = 24, debug_dir: str = None, debug_every: int = 24,
+           denoise_h: int = 7, sharpen: float = 0.15,
+           temporal_strength: float = 0.35, motion_thresh: float = 9.0):
 
     start_sec = parse_time(start_ts)
     end_sec   = parse_time(end_ts)
@@ -358,11 +436,17 @@ def encode(input_path: str, start_ts: str, end_ts: str, output_path: str,
     print(f"Clip: {start_ts} → {end_ts}  ({duration:.1f}s)")
     print(f"Target FPS: {fps}")
 
-    # Compute which source frames to sample
+    # Compute source/target frame mapping.
+    # We read source sequentially from the clip start and advance to each target
+    # source frame index. This avoids per-frame random seeking jitter/flicker.
     total_frames = int(duration * fps)
-    source_times = [start_sec + i / fps for i in range(total_frames)]
+    start_src_frame = max(0, int(round(start_sec * source_fps)))
+    src_frame_step = source_fps / float(fps)
 
     print(f"Total encoded frames: {total_frames}")
+    print(f"Source start frame: {start_src_frame}")
+    print(f"Filter: denoise_h={denoise_h} sharpen={sharpen:.2f} "
+          f"temporal={temporal_strength:.2f} motion_thresh={motion_thresh:.1f}")
     print(f"Frame payload: {FRAME_BYTES:,} bytes")
     print(f"Total stream size: {total_frames * FRAME_BYTES / 1024 / 1024:.1f} MiB")
     print(f"Required read bandwidth: {total_frames * FRAME_BYTES / duration / 1024:.0f} KiB/s "
@@ -378,21 +462,48 @@ def encode(input_path: str, start_ts: str, end_ts: str, output_path: str,
 
         total_written = 0
         t0 = time.time()
+        prev_pal32 = None
+        prev_filtered_bgr = None
+        frame_data = bytes(FRAME_BYTES)
 
-        for frame_idx, pts in enumerate(source_times):
-            cap.set(cv2.CAP_PROP_POS_MSEC, pts * 1000.0)
-            ok, bgr = cap.read()
-            if not ok:
-                print(f"WARNING: Could not read frame {frame_idx} at {pts:.3f}s — repeating last")
-                # Re-use the last encoded frame bytes
+        # Sequential source decode state
+        cap.set(cv2.CAP_PROP_POS_FRAMES, float(start_src_frame))
+        next_src_frame = start_src_frame
+        current_src_frame = start_src_frame - 1
+        current_bgr = None
+
+        for frame_idx in range(total_frames):
+            target_src_frame = start_src_frame + int(round(frame_idx * src_frame_step))
+
+            while current_src_frame < target_src_frame:
+                ok, bgr = cap.read()
+                if not ok:
+                    bgr = None
+                    break
+                current_bgr = bgr
+                current_src_frame = next_src_frame
+                next_src_frame += 1
+
+            if current_bgr is None:
+                print(f"WARNING: Could not read source frame near target {target_src_frame} — repeating last")
                 fout.write(frame_data)
                 total_written += FRAME_BYTES
                 continue
 
             # Resize to fill 320x240, cropping left/right as needed.
-            bgr = resize_with_center_crop(bgr, SCREEN_W, SCREEN_H)
+            bgr = resize_with_center_crop(current_bgr, SCREEN_W, SCREEN_H)
 
-            frame_data = encode_frame(bgr)
+            bgr = preprocess_frame(
+                bgr,
+                prev_filtered_bgr,
+                denoise_h=denoise_h,
+                sharpen=sharpen,
+                temporal_strength=temporal_strength,
+                motion_thresh=motion_thresh,
+            )
+            prev_filtered_bgr = bgr
+
+            frame_data, prev_pal32 = encode_frame(bgr, prev_palette32=prev_pal32)
             fout.write(frame_data)
             total_written += FRAME_BYTES
 
@@ -458,6 +569,14 @@ def main():
     enc.add_argument("--debug-dir", default=None, help="Save debug PNGs here")
     enc.add_argument("--debug-every", type=int, default=24,
                      help="Save a debug PNG every N frames (default: 24)")
+    enc.add_argument("--denoise-h", type=int, default=7,
+                     help="Luma denoise strength (0 disables, default: 7)")
+    enc.add_argument("--sharpen", type=float, default=0.15,
+                     help="Unsharp amount after denoise (default: 0.15)")
+    enc.add_argument("--temporal", type=float, default=0.35,
+                     help="Static-region temporal blend strength (default: 0.35)")
+    enc.add_argument("--motion-thresh", type=float, default=9.0,
+                     help="Motion threshold for temporal blend (default: 9.0)")
 
     ver = sub.add_parser("verify", help="Decode and inspect a packed stream")
     ver.add_argument("stream", help="MT62 binary stream file")
@@ -468,7 +587,9 @@ def main():
 
     if args.cmd == "encode":
         encode(args.input, args.start, args.end, args.output,
-               fps=args.fps, debug_dir=args.debug_dir, debug_every=args.debug_every)
+               fps=args.fps, debug_dir=args.debug_dir, debug_every=args.debug_every,
+               denoise_h=args.denoise_h, sharpen=args.sharpen,
+               temporal_strength=args.temporal, motion_thresh=args.motion_thresh)
     elif args.cmd == "verify":
         verify(args.stream, args.debug_dir, args.frames)
 

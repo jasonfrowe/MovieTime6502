@@ -4,3 +4,6 @@ __pycache__
 .venv
 Sprites
 .DS_Store
+/external/llvm-mos
+/external/llvm-mos-sdk/build
+Movies
