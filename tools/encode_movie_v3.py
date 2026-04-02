@@ -123,18 +123,6 @@ def find_tiles(indexed_img: np.ndarray, n_tiles: int) -> tuple[np.ndarray, np.nd
 
         tile_map = tile_ids.reshape(ROWS, COLS).astype(np.uint8)
 
-    # --- NEW: Pin the blank/black tile to ID 0 ---
-    # This perfectly masks hardware tearing in main.c by ensuring the old map's
-    # background tiles point to the same empty slot while the new map loads over USB!
-    tile_sums = tile_dict.reshape(n_tiles, -1).sum(axis=1)
-    zero_idx = int(np.argmin(tile_sums))
-    if zero_idx != 0:
-        tile_dict[[0, zero_idx]] = tile_dict[[zero_idx, 0]]
-        tile_map = np.where(tile_map == 0, -1, tile_map)  # Temp swap placeholder
-        tile_map = np.where(tile_map == zero_idx, 0, tile_map)
-        tile_map = np.where(tile_map == -1, zero_idx, tile_map).astype(np.uint8)
-    tile_dict[0] = 0  # Pin to truly all-zeros
-
     return tile_dict, tile_map
 
 
@@ -164,52 +152,21 @@ def encode_frame(frame_bgr: np.ndarray, prev_centers=None) -> tuple[bytes, np.nd
     luma = 0.299 * centers[:, 0] + 0.587 * centers[:, 1] + 0.114 * centers[:, 2]
     centers = centers[np.argsort(luma)]
 
-    # Heavy Temporal Inertia: Blend 70% of the previous sorted palette with 30% of the new.
-    # This completely prevents colors of similar brightness from swapping layers due to film grain,
-    # locking the alternating striped patterns in place!
-    if prev_centers is not None:
-        centers = np.round(centers * 0.3 + prev_centers * 0.7).astype(np.uint8)
-
-    # Force the absolute darkest color to be a pure black anchor.
-    # Base layer will draw this on Odd columns, effectively giving Overlay layer 
-    # a free black anchor via its Transparent index 0!
-    centers[0] = [0, 0, 0]
-
+    # Split palettes by alternating brightness to guarantee a perfect mix
+    base_palette = centers[0::2]  # 16 colors (Even indices)
     overlay_palette = np.zeros((16, 3), dtype=np.uint8)
-    base_palette = np.zeros((16, 3), dtype=np.uint8)
-    base_palette[0] = centers[0]
-
-    # Intelligently divide the remaining 30 colors into 15 pairs based on RGB similarity.
-    # This guarantees that for every color in the Even columns, there is a nearly 
-    # identical color for the Odd columns, completely eliminating "widely jumping" colors!
-    pool = list(centers[1:])
-    for i in range(1, 16):
-        c1 = pool.pop(0)  # Darkest available
-        
-        # Find closest RGB match in the remaining pool
-        dists = [np.sum((c1.astype(np.int32) - c2.astype(np.int32))**2) for c2 in pool]
-        best_idx = int(np.argmin(dists))
-        c2 = pool.pop(best_idx)
-        
-        base_palette[i] = c1
-        overlay_palette[i] = c2
+    overlay_palette[1:] = centers[1::2] # 15 colors (Odd indices), 0 is transparent
 
     # 3. Base Layer (Even Columns)
     diff_base = frame_rgb.astype(np.int32)[:, :, None, :] - base_palette.astype(np.int32)[None, None, :, :]
     err_base = np.sum(diff_base**2, axis=3)
     base_img_idx = np.argmin(err_base, axis=2).astype(np.uint8)
-
-    # Spatial smoothing to eliminate 1-pixel film grain before locking columns
-    base_img_idx = cv2.medianBlur(base_img_idx, 3)
     base_img_idx[:, 1::2] = 0  # Force Odd columns to 0 to simplify tile clustering
 
     # 4. Overlay Layer (Odd Columns)
     diff_ov = frame_rgb.astype(np.int32)[:, :, None, :] - overlay_palette.astype(np.int32)[None, None, 1:, :]
     err_ov = np.sum(diff_ov**2, axis=3)
     ov_img_idx = np.argmin(err_ov, axis=2).astype(np.uint8) + 1 # Offset by 1 since 0 is transparent
-
-    # Spatial smoothing
-    ov_img_idx = cv2.medianBlur(ov_img_idx, 3)
     ov_img_idx[:, 0::2] = 0    # Force Even columns to transparent (0)
 
     # 5. Compress the partitioned layers down to 256 tiles each
@@ -224,7 +181,7 @@ def encode_frame(frame_bgr: np.ndarray, prev_centers=None) -> tuple[bytes, np.nd
     map2_bytes   = bytes(overlay_map.flatten())                              # overlay -> Layer 2 slot
     map1_bytes   = bytes(base_map.flatten())                                 # base    -> Layer 1 slot
 
-    return pal1_bytes + pal2_bytes + tiles2_bytes + tiles1_bytes + map2_bytes + map1_bytes, centers
+    return pal1_bytes + pal2_bytes + tiles2_bytes + tiles1_bytes + map2_bytes + map1_bytes, raw_centers
 
 
 def reconstruct_frame(frame_bytes: bytes) -> np.ndarray:
