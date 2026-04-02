@@ -2,4 +2,5 @@ __pycache__
 /.rp6502
 /build
 .venv
+Sprites
 

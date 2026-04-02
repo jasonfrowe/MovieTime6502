@@ -18,6 +18,8 @@ else()
 endif()
 
 add_executable(MovieTime6502)
+rp6502_asset(MovieTime6502 0x10000 images/tiles1.bin)
+rp6502_asset(MovieTime6502 0x104B0 images/tiles2.bin)
 rp6502_asset(MovieTime6502 help src/help.txt)
 
 rp6502_executable(MovieTime6502 

@@ -1,123 +1,94 @@
-/*
- * Copyright (c) 2025 Rumbledethumps
- *
- * SPDX-License-Identifier: BSD-3-Clause
- * SPDX-License-Identifier: Unlicense
- */
-
 #include <rp6502.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <errno.h>
-#include <time.h>
-#include <fcntl.h>
+#include <stdbool.h>
+#include "constants.h"
+#include "palette.h"
 
-// VERY simple benchmark for mass storage.
-// Final score discards fastest and slowest 1/sec bucket.
+unsigned TILEMAP1_CONFIG;
+unsigned TILEMAP2_CONFIG;
 
-#define BENCH_FILE "BENCH.OK_TO_DEL"
-#define NUM_PASSES 9
-#define CHUNK_SIZE 1024
-
-static long score(long *sec, int count)
+static void init_graphics(void)
 {
-    long vmin, vmax, sum;
-    int i;
-    if (count < 3)
-        return 0;
-    vmin = vmax = sum = sec[0];
-    for (i = 1; i < count; i++)
-    {
-        sum += sec[i];
-        if (sec[i] < vmin) vmin = sec[i];
-        if (sec[i] > vmax) vmax = sec[i];
+
+    // Select a 320x240 canvas
+    if (xreg_vga_canvas(1) < 0) {
+        puts("xreg_vga_canvas failed");
+        return;
     }
-    return (sum - vmin - vmax) / (1024L * (count - 2));
+
+    RIA.addr0 = PALETTE_ADDR1;
+    RIA.step0 = 1;
+    for (int i = 0; i < 16; i++) {
+        RIA.rw0 = tile_palette[i] & 0xFF;
+        RIA.rw0 = tile_palette[i] >> 8;
+    }
+
+    RIA.addr0 = PALETTE_ADDR2;
+    RIA.step0 = 1;
+    for (int i = 0; i < 16; i++) {
+        RIA.rw0 = tile_palette[i] & 0xFF;
+        RIA.rw0 = tile_palette[i] >> 8;
+    }
+
+    TILEMAP1_CONFIG = SPRITE_DATA_END;
+
+    xram0_struct_set(TILEMAP1_CONFIG, vga_mode2_config_t, x_wrap, false);
+    xram0_struct_set(TILEMAP1_CONFIG, vga_mode2_config_t, y_wrap, false);
+    xram0_struct_set(TILEMAP1_CONFIG, vga_mode2_config_t, x_pos_px, 0);
+    xram0_struct_set(TILEMAP1_CONFIG, vga_mode2_config_t, y_pos_px, 0);
+    xram0_struct_set(TILEMAP1_CONFIG, vga_mode2_config_t, width_tiles,  WIDTH_TILES);
+    xram0_struct_set(TILEMAP1_CONFIG, vga_mode2_config_t, height_tiles, HEIGHT_TILES);
+    xram0_struct_set(TILEMAP1_CONFIG, vga_mode2_config_t, xram_data_ptr,    TILEMAP1_DATA); // tile ID grid
+    xram0_struct_set(TILEMAP1_CONFIG, vga_mode2_config_t, xram_palette_ptr, PALETTE_ADDR1);
+    xram0_struct_set(TILEMAP1_CONFIG, vga_mode2_config_t, xram_tile_ptr,    TILES1_DATA);  
+
+    // Mode 2 args: MODE, OPTIONS, CONFIG, PLANE, BEGIN, END
+    // OPTIONS: bit3=0 (8x8 tiles), bit[2:0]=2 (4-bit color index) => 0b0010 = 2
+    // Plane 0 = background fill layer (behind sprite plane 1)
+    if (xreg_vga_mode(2, 0x02, TILEMAP1_CONFIG, 2, 0, 0) < 0) {
+        puts("xreg_vga_mode failed");
+        return;
+    }
+
+    TILEMAP2_CONFIG = TILEMAP1_CONFIG + sizeof(vga_mode2_config_t);
+
+    xram0_struct_set(TILEMAP2_CONFIG, vga_mode2_config_t, x_wrap, false);
+    xram0_struct_set(TILEMAP2_CONFIG, vga_mode2_config_t, y_wrap, false);
+    xram0_struct_set(TILEMAP2_CONFIG, vga_mode2_config_t, x_pos_px, 0);
+    xram0_struct_set(TILEMAP2_CONFIG, vga_mode2_config_t, y_pos_px, 0);
+    xram0_struct_set(TILEMAP2_CONFIG, vga_mode2_config_t, width_tiles,  WIDTH_TILES);
+    xram0_struct_set(TILEMAP2_CONFIG, vga_mode2_config_t, height_tiles, HEIGHT_TILES);
+    xram0_struct_set(TILEMAP2_CONFIG, vga_mode2_config_t, xram_data_ptr,    TILEMAP2_DATA); // tile ID grid
+    xram0_struct_set(TILEMAP2_CONFIG, vga_mode2_config_t, xram_palette_ptr, PALETTE_ADDR2);
+    xram0_struct_set(TILEMAP2_CONFIG, vga_mode2_config_t, xram_tile_ptr,    TILES2_DATA);  
+
+    // Mode 2 args: MODE, OPTIONS, CONFIG, PLANE, BEGIN, END
+    // OPTIONS: bit3=0 (8x8 tiles), bit[2:0]=2 (4-bit color index) => 0b0010 = 2
+    // Plane 0 = background fill layer (behind sprite plane 1)
+    if (xreg_vga_mode(2, 0x02, TILEMAP2_CONFIG, 1, 0, 0) < 0) {
+        puts("xreg_vga_mode failed");
+        return;
+    }
+
+
 }
 
-static int run_pass(int fd, char label, int writing, long *sec)
-{
-    long bucket_bytes = 0;
-    long start;
-    long now;
-    int bucket = 0;
-    int n;
-    start = clock();
-    while (writing ? bucket < NUM_PASSES : 1)
-    {
-        n = writing ? write_xram(0, CHUNK_SIZE, fd) : read_xram(0, CHUNK_SIZE, fd);
-        if (n <= 0)
-            break;
-        bucket_bytes += n;
-        now = clock();
-        if (now - start >= (long)(bucket + 1) * 100L)
-        {
-            sec[bucket] = bucket_bytes;
-            printf("%c%d:%5ld KB/s\n", label, bucket + 1, bucket_bytes / 1024);
-            bucket_bytes = 0;
-            bucket++;
-        }
-    }
-    return bucket;
-}
+#define SONG_HZ 60
+uint8_t vsync_last = 0;
+uint16_t timer_accumulator = 0;
+bool music_enabled = true;
 
 int main(void)
 {
-    int fd;
-    int i;
-    long write_sec[NUM_PASSES] = {0};
-    long read_sec[NUM_PASSES] = {0};
-    int write_count, read_count;
-    long ws, rs;
+    init_graphics();
 
-    printf("MSC BENCHMARK\n-------------\n");
+    while (true) {
+        // Main game loop
+        // 1. SYNC
+        if (RIA.vsync == vsync_last) continue;
+        vsync_last = RIA.vsync;
 
-    // Prepare random data.
-    srand((unsigned)lrand());
-    RIA.addr0 = 0;
-    RIA.step0 = 1;
-    for (i = 0; i < CHUNK_SIZE; i++)
-        RIA.rw0 = rand();
-
-    remove(BENCH_FILE);
-    fd = open(BENCH_FILE, O_WRONLY | O_CREAT | O_TRUNC);
-    if (fd < 0)
-    {
-        printf("Open write failed: %d\n", errno);
-        return 1;
     }
-    write_count = run_pass(fd, 'W', 1, write_sec);
-    close(fd);
 
-    fd = open(BENCH_FILE, O_RDONLY);
-    if (fd < 0)
-    {
-        printf("Open read failed: %d\n", errno);
-        remove(BENCH_FILE);
-        return 1;
-    }
-    read_count = run_pass(fd, 'R', 0, read_sec);
-    close(fd);
-
-    printf("\n   ");
-    for (i = 0; i < NUM_PASSES; i++)
-        printf("    %ds", i + 1);
-    printf("\n");
-    printf("Wr:");
-    for (i = 0; i < NUM_PASSES; i++)
-        printf(" %5ld", write_sec[i] / 1024);
-    printf(" KB/s\n");
-    printf("Rd:");
-    for (i = 0; i < NUM_PASSES; i++)
-        printf(" %5ld", read_sec[i] / 1024);
-    printf(" KB/s\n");
-
-    ws = score(write_sec, write_count);
-    rs = score(read_sec, read_count);
-    printf(ws > 0 ? "\nWrite: %ld KB/s\n" : "\nWrite: N/A\n", ws);
-    printf(rs > 0 ? "Read:  %ld KB/s\n" : "Read:  N/A\n", rs);
-
-    remove(BENCH_FILE);
     return 0;
 }

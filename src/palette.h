@@ -1,0 +1,25 @@
+#ifndef PALETTE_H
+#define PALETTE_H
+
+#include <stdint.h>
+
+uint16_t tile_palette[16] = {
+    0x0020, // Index 0
+    0x10A2,
+    0x2124,
+    0x31A6,
+    0x4228,
+    0x52AA,
+    0x632C,
+    0x73AE,
+    0x8C71,
+    0x9CF3,
+    0xAD75,
+    0xBDF7,
+    0xCE79,
+    0xDEFB,
+    0xEF7D,
+    0xFFFF,
+};
+
+#endif // PALETTE_H
