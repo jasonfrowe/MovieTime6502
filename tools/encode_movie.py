@@ -123,6 +123,7 @@ def preprocess_frame(
     sharpen: float,
     temporal_strength: float,
     motion_thresh: float,
+    bright_threshold: float,
 ) -> np.ndarray:
     """
     Reduce film grain/shimmer before quantization while preserving motion edges.
@@ -146,17 +147,26 @@ def preprocess_frame(
     filtered = cv2.cvtColor(ycc, cv2.COLOR_YCrCb2BGR)
 
     if prev_filtered_bgr is None or temporal_strength <= 0.0:
-        return filtered
+        out = filtered
+    else:
+        # Blend only low-motion regions to reduce flicker without ghosting motion.
+        curr_g = cv2.cvtColor(filtered, cv2.COLOR_BGR2GRAY)
+        prev_g = cv2.cvtColor(prev_filtered_bgr, cv2.COLOR_BGR2GRAY)
+        motion = cv2.absdiff(curr_g, prev_g).astype(np.float32)
+        static_mask = (motion < float(motion_thresh)).astype(np.float32)[:, :, None]
 
-    # Blend only low-motion regions to reduce flicker without ghosting motion.
-    curr_g = cv2.cvtColor(filtered, cv2.COLOR_BGR2GRAY)
-    prev_g = cv2.cvtColor(prev_filtered_bgr, cv2.COLOR_BGR2GRAY)
-    motion = cv2.absdiff(curr_g, prev_g).astype(np.float32)
-    static_mask = (motion < float(motion_thresh)).astype(np.float32)[:, :, None]
+        alpha = np.clip(float(temporal_strength), 0.0, 0.95)
+        blended = filtered.astype(np.float32) * (1.0 - alpha * static_mask) + prev_filtered_bgr.astype(np.float32) * (alpha * static_mask)
+        out = np.clip(np.round(blended), 0, 255).astype(np.uint8)
 
-    alpha = np.clip(float(temporal_strength), 0.0, 0.95)
-    blended = filtered.astype(np.float32) * (1.0 - alpha * static_mask) + prev_filtered_bgr.astype(np.float32) * (alpha * static_mask)
-    return np.clip(np.round(blended), 0, 255).astype(np.uint8)
+    # Optional content gating: crush dim luma to black to spend palette/tile
+    # budget on brighter, higher-contrast structures.
+    if bright_threshold > 0.0:
+        y = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        keep = y >= float(bright_threshold)
+        out = np.where(keep[:, :, None], out, 0).astype(np.uint8)
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +267,19 @@ def nearest_palette_indices(frame_rgb: np.ndarray, palette_rgb: np.ndarray) -> t
     return idx, best_err
 
 
-def encode_frame(frame_bgr: np.ndarray, prev_palette32=None) -> tuple[bytes, np.ndarray]:
+def stable_sort_palette(palette_rgb: np.ndarray) -> np.ndarray:
+    """Sort a palette deterministically to reduce frame-to-frame index churn."""
+    luma = (0.299 * palette_rgb[:, 0] + 0.587 * palette_rgb[:, 1] + 0.114 * palette_rgb[:, 2])
+    order = np.lexsort((palette_rgb[:, 2], palette_rgb[:, 1], palette_rgb[:, 0], luma))
+    return palette_rgb[order]
+
+
+def encode_frame(
+    frame_bgr: np.ndarray,
+    prev_palette32=None,
+    dark_lock_luma: float = 0.0,
+    prev_overlay_mask: np.ndarray = None,
+) -> tuple[bytes, np.ndarray, np.ndarray]:
     """
     Encode a single 320×240 BGR frame into FRAME_BYTES bytes.
     Strategy:
@@ -280,11 +302,23 @@ def encode_frame(frame_bgr: np.ndarray, prev_palette32=None) -> tuple[bytes, np.
     pal1_global_idx = order[COLOURS:COLOURS + VISIBLE_OVERLAY_COLOURS]
 
     palette2_rgb = pal32[pal2_global_idx]   # (16, 3), always visible
+    palette2_rgb = stable_sort_palette(palette2_rgb)
+    palette2_rgb[0] = np.array([0, 0, 0], dtype=np.uint8)  # stable black anchor
     palette1_rgb = np.zeros((COLOURS, 3), dtype=np.uint8)
-    palette1_rgb[1:] = pal32[pal1_global_idx]
+    palette1_rgb[1:] = stable_sort_palette(pal32[pal1_global_idx])
 
-    # Base gets nearest colour for every pixel (never forced to index 0 black).
+    # Base gets nearest colour for every pixel.
     img2_idx, err2 = nearest_palette_indices(frame_rgb, palette2_rgb)
+    src_luma = (0.299 * frame_rgb[:, :, 0] + 0.587 * frame_rgb[:, :, 1] + 0.114 * frame_rgb[:, :, 2])
+
+    # Stabilize tiny per-pixel index jitter before tile clustering.
+    img2_idx = cv2.medianBlur(img2_idx, 3)
+
+    # Lock near-threshold/dark background to stable black to suppress tile flicker.
+    dark_lock_mask = np.zeros_like(img2_idx, dtype=bool)
+    if dark_lock_luma > 0.0:
+        dark_lock_mask = src_luma < float(dark_lock_luma)
+        img2_idx = np.where(dark_lock_mask, 0, img2_idx).astype(np.uint8)
 
     # Overlay candidate uses 15 visible entries (index 1..15), index 0 reserved transparent.
     ov_idx_raw, err1 = nearest_palette_indices(frame_rgb, palette1_rgb[1:])
@@ -292,16 +326,41 @@ def encode_frame(frame_bgr: np.ndarray, prev_palette32=None) -> tuple[bytes, np.
 
     # Only enable overlay where it materially improves colour error over base,
     # and avoid overlay in very dark regions to suppress sparkly noise.
-    src_luma = (0.299 * frame_rgb[:, :, 0] + 0.587 * frame_rgb[:, :, 1] + 0.114 * frame_rgb[:, :, 2])
-    overlay_mask = (err1 * 10 < err2 * 7) & (src_luma > 20.0)  # ~30% better + dark gate
+    raw_overlay = (err1 * 10 < err2 * 6) & (src_luma > 28.0) & (~dark_lock_mask)  # ~40% better + stronger dark gate
+
+    # Temporal hysteresis: keep existing overlay more easily than admitting new
+    # overlay. This suppresses frame-to-frame sparkle in marginal regions.
+    if prev_overlay_mask is not None and prev_overlay_mask.shape == raw_overlay.shape:
+        keep_existing = prev_overlay_mask & (err1 * 10 < err2 * 8) & (src_luma > 24.0) & (~dark_lock_mask)
+        admit_new = (~prev_overlay_mask) & (err1 * 10 < err2 * 5) & (src_luma > 34.0) & (~dark_lock_mask)
+        overlay_mask = keep_existing | admit_new
+    else:
+        overlay_mask = raw_overlay
+
+    # Spatial cleanup in tile space: drop sparse/noisy overlay tiles that flicker.
+    ov_tile_cov = overlay_mask.reshape(ROWS, TILE_H, COLS, TILE_W).mean(axis=(1, 3))
+    ov_tile_on = ov_tile_cov >= 0.22
+    overlay_mask = overlay_mask & np.repeat(np.repeat(ov_tile_on, TILE_H, axis=0), TILE_W, axis=1)
+
     img1_idx = np.where(overlay_mask, ov_idx, 0).astype(np.uint8)
 
     # ----- Step 2: Base layer tile dictionary (256 tiles) -------------------
     tile_dict2, tile_map2 = find_tiles(img2_idx, NUM_TILES)
 
+    # Enforce a true all-black base tile and pin dark tile cells to it.
+    tile_dict2[0] = 0
+    if dark_lock_luma > 0.0:
+        dark_tile_mask = dark_lock_mask.reshape(ROWS, TILE_H, COLS, TILE_W).mean(axis=(1, 3)) > 0.70
+        tile_map2 = np.where(dark_tile_mask, 0, tile_map2).astype(np.uint8)
+
     # ----- Step 3: Overlay layer tile dictionary (256 tiles) ----------------
     # Use the same per-pixel quantization but remapped to palette1 indices.
     tile_dict1, tile_map1 = find_tiles(img1_idx, NUM_TILES)
+
+    # Enforce a true transparent overlay tile and pin sparse overlay cells to it.
+    tile_dict1[0] = 0
+    ov_tile_cov = (img1_idx.reshape(ROWS, TILE_H, COLS, TILE_W) > 0).mean(axis=(1, 3))
+    tile_map1 = np.where(ov_tile_cov < 0.18, 0, tile_map1).astype(np.uint8)
 
     # ----- Pack the frame ---------------------------------------------------
     # Layer 1 (MIDDLE) slot ← base (fully opaque palette, base tiles/map)
@@ -315,7 +374,7 @@ def encode_frame(frame_bgr: np.ndarray, prev_palette32=None) -> tuple[bytes, np.
 
     frame_bytes = pal1_bytes + pal2_bytes + tiles2_bytes + tiles1_bytes + map2_bytes + map1_bytes
     assert len(frame_bytes) == FRAME_BYTES, f"Frame size mismatch: {len(frame_bytes)}"
-    return frame_bytes, pal32
+    return frame_bytes, pal32, overlay_mask
 
 
 # ---------------------------------------------------------------------------
@@ -419,8 +478,9 @@ def parse_time(ts: str) -> float:
 
 def encode(input_path: str, start_ts: str, end_ts: str, output_path: str,
            fps: int = 24, debug_dir: str = None, debug_every: int = 24,
-           denoise_h: int = 7, sharpen: float = 0.15,
-           temporal_strength: float = 0.35, motion_thresh: float = 9.0):
+           denoise_h: int = 9, sharpen: float = 0.10,
+           temporal_strength: float = 0.50, motion_thresh: float = 8.0,
+           bright_threshold: float = 0.0, dark_lock_margin: float = 10.0):
 
     start_sec = parse_time(start_ts)
     end_sec   = parse_time(end_ts)
@@ -447,6 +507,9 @@ def encode(input_path: str, start_ts: str, end_ts: str, output_path: str,
     print(f"Source start frame: {start_src_frame}")
     print(f"Filter: denoise_h={denoise_h} sharpen={sharpen:.2f} "
           f"temporal={temporal_strength:.2f} motion_thresh={motion_thresh:.1f}")
+    if bright_threshold > 0.0:
+        print(f"Luma gate: keep pixels with luma >= {bright_threshold:.1f}")
+        print(f"Dark lock: force luma < {bright_threshold + dark_lock_margin:.1f} to stable black")
     print(f"Frame payload: {FRAME_BYTES:,} bytes")
     print(f"Total stream size: {total_frames * FRAME_BYTES / 1024 / 1024:.1f} MiB")
     print(f"Required read bandwidth: {total_frames * FRAME_BYTES / duration / 1024:.0f} KiB/s "
@@ -463,6 +526,7 @@ def encode(input_path: str, start_ts: str, end_ts: str, output_path: str,
         total_written = 0
         t0 = time.time()
         prev_pal32 = None
+        prev_overlay_mask = None
         prev_filtered_bgr = None
         frame_data = bytes(FRAME_BYTES)
 
@@ -500,10 +564,17 @@ def encode(input_path: str, start_ts: str, end_ts: str, output_path: str,
                 sharpen=sharpen,
                 temporal_strength=temporal_strength,
                 motion_thresh=motion_thresh,
+                bright_threshold=bright_threshold,
             )
             prev_filtered_bgr = bgr
 
-            frame_data, prev_pal32 = encode_frame(bgr, prev_palette32=prev_pal32)
+            dark_lock_luma = (bright_threshold + dark_lock_margin) if bright_threshold > 0.0 else 0.0
+            frame_data, prev_pal32, prev_overlay_mask = encode_frame(
+                bgr,
+                prev_palette32=prev_pal32,
+                dark_lock_luma=dark_lock_luma,
+                prev_overlay_mask=prev_overlay_mask,
+            )
             fout.write(frame_data)
             total_written += FRAME_BYTES
 
@@ -569,14 +640,18 @@ def main():
     enc.add_argument("--debug-dir", default=None, help="Save debug PNGs here")
     enc.add_argument("--debug-every", type=int, default=24,
                      help="Save a debug PNG every N frames (default: 24)")
-    enc.add_argument("--denoise-h", type=int, default=7,
-                     help="Luma denoise strength (0 disables, default: 7)")
-    enc.add_argument("--sharpen", type=float, default=0.15,
-                     help="Unsharp amount after denoise (default: 0.15)")
-    enc.add_argument("--temporal", type=float, default=0.35,
-                     help="Static-region temporal blend strength (default: 0.35)")
-    enc.add_argument("--motion-thresh", type=float, default=9.0,
-                     help="Motion threshold for temporal blend (default: 9.0)")
+    enc.add_argument("--denoise-h", type=int, default=9,
+                     help="Luma denoise strength (0 disables, default: 9)")
+    enc.add_argument("--sharpen", type=float, default=0.10,
+                     help="Unsharp amount after denoise (default: 0.10)")
+    enc.add_argument("--temporal", type=float, default=0.50,
+                     help="Static-region temporal blend strength (default: 0.50)")
+    enc.add_argument("--motion-thresh", type=float, default=8.0,
+                     help="Motion threshold for temporal blend (default: 8.0)")
+    enc.add_argument("--bright-threshold", type=float, default=0.0,
+                     help="Drop pixels below this luma (0-255). 0 disables (default: 0)")
+    enc.add_argument("--dark-lock-margin", type=float, default=10.0,
+                     help="Extra luma margin above threshold that is forced to stable black (default: 10)")
 
     ver = sub.add_parser("verify", help="Decode and inspect a packed stream")
     ver.add_argument("stream", help="MT62 binary stream file")
@@ -589,7 +664,9 @@ def main():
         encode(args.input, args.start, args.end, args.output,
                fps=args.fps, debug_dir=args.debug_dir, debug_every=args.debug_every,
                denoise_h=args.denoise_h, sharpen=args.sharpen,
-               temporal_strength=args.temporal, motion_thresh=args.motion_thresh)
+             temporal_strength=args.temporal, motion_thresh=args.motion_thresh,
+               bright_threshold=args.bright_threshold,
+               dark_lock_margin=args.dark_lock_margin)
     elif args.cmd == "verify":
         verify(args.stream, args.debug_dir, args.frames)
 

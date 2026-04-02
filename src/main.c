@@ -121,6 +121,29 @@ static void write_palette_raw(unsigned xram_addr, const unsigned char *data)
 static unsigned char pal_buf[FRAME_PALETTE1_BYTES + FRAME_PALETTE2_BYTES];
 
 // ---------------------------------------------------------------------------
+// Debug layer view controls (compile-time)
+//   DEBUG_VIEW_NORMAL       : show both layers (default)
+//   DEBUG_VIEW_BASE_ONLY    : hide top overlay layer
+//   DEBUG_VIEW_OVERLAY_ONLY : hide middle base layer (shows overlay on black)
+// ---------------------------------------------------------------------------
+#define DEBUG_VIEW_NORMAL        0
+#define DEBUG_VIEW_BASE_ONLY     1
+#define DEBUG_VIEW_OVERLAY_ONLY  2
+
+#ifndef DEBUG_VIEW_MODE
+#define DEBUG_VIEW_MODE DEBUG_VIEW_NORMAL
+#endif
+
+static void fill_palette_word(unsigned char *dst, uint16_t word)
+{
+    int i;
+    for (i = 0; i < (FRAME_PALETTE1_BYTES / 2); i++) {
+        dst[i * 2]     = (unsigned char)(word & 0xFF);
+        dst[i * 2 + 1] = (unsigned char)((word >> 8) & 0xFF);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Cadence table for 24 fps presentation on a 60 Hz display.
 // 60/24 = 2.5 vsyncs per frame, so we alternate 2 and 3 vsyncs.
 // 5-entry repeating cycle: 2,3,2,3,2 = 12 vsyncs = 5 frames (200ms)
@@ -196,6 +219,14 @@ int main(int argc, char *argv[])
         }
     }
     printf("Playing: %s\n", filename);
+
+#if DEBUG_VIEW_MODE == DEBUG_VIEW_BASE_ONLY
+    puts("Debug view: BASE ONLY");
+#elif DEBUG_VIEW_MODE == DEBUG_VIEW_OVERLAY_ONLY
+    puts("Debug view: OVERLAY ONLY");
+#else
+    puts("Debug view: NORMAL");
+#endif
 
     if (!init_graphics()) {
         puts("Graphics init failed");
@@ -284,6 +315,14 @@ int main(int argc, char *argv[])
         wait_vsync();
 
         // Write palettes immediately after vsync for minimal tearing
+    #if DEBUG_VIEW_MODE == DEBUG_VIEW_BASE_ONLY
+        // Force top overlay layer palette fully transparent.
+        fill_palette_word(pal_buf + FRAME_PALETTE1_BYTES, 0x0000);
+    #elif DEBUG_VIEW_MODE == DEBUG_VIEW_OVERLAY_ONLY
+        // Force middle base layer palette to opaque black.
+        fill_palette_word(pal_buf, 0x0020);
+    #endif
+
         write_palette_raw(PALETTE_ADDR1, pal_buf);
         write_palette_raw(PALETTE_ADDR2, pal_buf + FRAME_PALETTE1_BYTES);
 
