@@ -255,21 +255,20 @@ def reconstruct_frame(frame_bytes: bytes) -> np.ndarray:
 
 
 def cmd_encode(args):
-    start_sec = parse_time(args.start)
-    end_sec = parse_time(args.end)
-    duration = end_sec - start_sec
-    total_target_frames = int(duration * args.fps)
-
     cap = cv2.VideoCapture(args.input)
     if not cap.isOpened():
         sys.exit(f"ERROR: Cannot open {args.input}")
 
     source_fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    start_sec = parse_time(args.start) if args.start else 0.0
+    end_sec   = parse_time(args.end)   if args.end   else cap.get(cv2.CAP_PROP_FRAME_COUNT) / source_fps
+    duration  = end_sec - start_sec
+    total_target_frames = int(duration * args.fps)
     start_src_frame = max(0, int(round(start_sec * source_fps)))
     src_frame_step = source_fps / float(args.fps)
 
     print(f"Encoding {args.input} to {args.output}")
-    print(f"Clip: {args.start} -> {args.end} ({duration:.1f}s)")
+    print(f"Clip: {args.start or '0'} -> {args.end or 'end'} ({duration:.1f}s)")
     print(f"Targeting {args.fps} FPS, ~{total_target_frames} frames total.\n")
 
     # Create output directory if it doesn't exist
@@ -362,8 +361,8 @@ def main():
 
     enc = sub.add_parser("encode", help="Encode a video clip into MT62 format")
     enc.add_argument("--input", default="Sprites/Metropolis_1927.mp4", help="Source MP4 file")
-    enc.add_argument("--start", required=True, help="Start timestamp HH:MM:SS")
-    enc.add_argument("--end", required=True, help="End timestamp HH:MM:SS")
+    enc.add_argument("--start", default="0",  help="Start timestamp HH:MM:SS (default: 0)")
+    enc.add_argument("--end",   default=None, help="End timestamp HH:MM:SS (default: end of video)")
     enc.add_argument("--output", default="Movies/MOVIE_metro.BIN", help="Output binary")
     enc.add_argument("--fps", type=int, default=24, help="Target FPS")
 

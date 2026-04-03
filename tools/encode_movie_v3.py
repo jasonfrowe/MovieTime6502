@@ -253,13 +253,14 @@ def cmd_encode(args):
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     cap = cv2.VideoCapture(args.input)
     source_fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-    start_frame, end_frame = int(parse_time(args.start) * source_fps), int(parse_time(args.end) * source_fps)
-    
+    start_frame = int((parse_time(args.start) if args.start else 0.0) * source_fps)
+    end_frame   = int(parse_time(args.end) * source_fps) if args.end else int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
     total_target_frames = int((end_frame - start_frame) / source_fps * args.fps)
     src_step = source_fps / args.fps
 
     print(f"Encoding {args.input} to {args.output}")
-    print(f"Clip: {args.start} -> {args.end}")
+    print(f"Clip: {args.start or '0'} -> {args.end or 'end'}")
     print(f"Targeting {args.fps} FPS, ~{total_target_frames} frames total.\n")
 
     with open(args.output, "wb") as fout:
@@ -319,8 +320,8 @@ def main():
 
     enc = sub.add_parser("encode", help="Encode a video clip into MT62 format")
     enc.add_argument("--input", default="Sprites/Metropolis_1927.mp4", help="Source MP4 file")
-    enc.add_argument("--start", required=True, help="Start timestamp")
-    enc.add_argument("--end", required=True, help="End timestamp")
+    enc.add_argument("--start", default="0",  help="Start timestamp HH:MM:SS (default: 0)")
+    enc.add_argument("--end",   default=None, help="End timestamp HH:MM:SS (default: end of video)")
     enc.add_argument("--output", default="Movies/MOVIE_metro_v3.BIN", help="Output binary")
     enc.add_argument("--fps", type=int, default=24, help="Target FPS")
 

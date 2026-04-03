@@ -494,18 +494,18 @@ def encode(input_path: str, start_ts: str, end_ts: str, output_path: str,
            temporal_strength: float = 0.50, motion_thresh: float = 8.0,
            bright_threshold: float = 0.0, dark_lock_margin: float = 10.0):
 
-    start_sec = parse_time(start_ts)
-    end_sec   = parse_time(end_ts)
-    duration  = end_sec - start_sec
-
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         sys.exit(f"ERROR: Cannot open {input_path}")
 
     source_fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    start_sec = parse_time(start_ts) if start_ts else 0.0
+    end_sec   = parse_time(end_ts)   if end_ts   else cap.get(cv2.CAP_PROP_FRAME_COUNT) / source_fps
+    duration  = end_sec - start_sec
+
     print(f"Source: {input_path}")
     print(f"Source FPS: {source_fps:.3f}")
-    print(f"Clip: {start_ts} → {end_ts}  ({duration:.1f}s)")
+    print(f"Clip: {start_ts or '0'} \u2192 {end_ts or 'end'}  ({duration:.1f}s)")
     print(f"Target FPS: {fps}")
 
     # Compute source/target frame mapping.
@@ -645,8 +645,8 @@ def main():
 
     enc = sub.add_parser("encode", help="Encode a video clip into MT62 format")
     enc.add_argument("--input",  required=True, help="Source MP4 file")
-    enc.add_argument("--start",  required=True, help="Start timestamp HH:MM:SS")
-    enc.add_argument("--end",    required=True, help="End timestamp HH:MM:SS")
+    enc.add_argument("--start",  default="0",  help="Start timestamp HH:MM:SS (default: 0)")
+    enc.add_argument("--end",    default=None, help="End timestamp HH:MM:SS (default: end of video)")
     enc.add_argument("--output", default="MOVIE.BIN", help="Output binary (default: MOVIE.BIN)")
     enc.add_argument("--fps",    type=int, default=24, help="Target playback FPS (default: 24)")
     enc.add_argument("--debug-dir", default=None, help="Save debug PNGs here")
