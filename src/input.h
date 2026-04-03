@@ -80,8 +80,28 @@ typedef struct {
 
 extern gamepad_t gamepad[GAMEPAD_COUNT];
 
+// ---------------------------------------------------------------------------// Gamepad field selectors (match RP6502 gamepad_t byte order)
 // ---------------------------------------------------------------------------
-// Media player actions
+#define GP_FIELD_DPAD    0
+#define GP_FIELD_STICKS  1
+#define GP_FIELD_BTN0    2
+#define GP_FIELD_BTN1    3
+
+// ---------------------------------------------------------------------------
+// Button mapping: one entry per action, for both keyboard and gamepad.
+// Keyboard: two optional USB HID keycodes (key2 == 0 means unused).
+// Gamepad:  primary field+mask, optional secondary field+mask (mask2==0=none).
+// ---------------------------------------------------------------------------
+typedef struct {
+    uint8_t keyboard_key;   // USB HID keycode (primary)
+    uint8_t keyboard_key2;  // USB HID keycode (secondary, 0 = none)
+    uint8_t gamepad_field;  // GP_FIELD_* constant
+    uint8_t gamepad_mask;   // Bit mask within that field (0 = unmapped)
+    uint8_t gamepad_field2; // Secondary GP field
+    uint8_t gamepad_mask2;  // Secondary bit mask (0 = none)
+} ButtonMapping;
+
+// ---------------------------------------------------------------------------// Media player actions
 // ---------------------------------------------------------------------------
 typedef enum {
     ACTION_PLAY_PAUSE,   // Space / Enter  |  START
