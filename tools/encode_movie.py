@@ -253,6 +253,20 @@ def find_tiles(indexed_img: np.ndarray, n_tiles: int) -> tuple[np.ndarray, np.nd
         tile_dict[k] = tiles_arr[best_idx].reshape(TILE_H, TILE_W).astype(np.uint8)
 
     tile_map = tile_ids.reshape(ROWS, COLS).astype(np.uint8)
+
+    # Swap the tile with the minimum pixel sum into slot 0, then pin it to all-zeros.
+    # This prevents a grain-contaminated tile from becoming the dark/transparent
+    # cluster representative, which causes repeating corner-pixel artifacts on dark frames.
+    tile_sums = tile_dict.reshape(n_tiles, -1).sum(axis=1)
+    zero_idx = int(np.argmin(tile_sums))
+    if zero_idx != 0:
+        tile_dict[[0, zero_idx]] = tile_dict[[zero_idx, 0]]
+        m0 = tile_map == 0
+        mz = tile_map == zero_idx
+        tile_map[m0] = zero_idx
+        tile_map[mz] = 0
+    tile_dict[0] = 0  # pin to truly all-zeros
+
     return tile_dict, tile_map
 
 
@@ -294,18 +308,18 @@ def encode_frame(
     # Warm-start from previous frame to reduce palette jump/flicker.
     pal32, labels32 = quantize_frame(frame_rgb, TOTAL_COLOURS, palette_hint=prev_palette32)
 
-    # Split by usage so base contains the most common colours for this frame.
-    # Overlay gets secondary colours and is applied only where it improves fit.
-    counts = np.bincount(labels32.reshape(-1), minlength=TOTAL_COLOURS)
-    order = np.argsort(-counts)  # most used -> least used
-    pal2_global_idx = order[:COLOURS]
-    pal1_global_idx = order[COLOURS:COLOURS + VISIBLE_OVERLAY_COLOURS]
-
-    palette2_rgb = pal32[pal2_global_idx]   # (16, 3), always visible
-    palette2_rgb = stable_sort_palette(palette2_rgb)
-    palette2_rgb[0] = np.array([0, 0, 0], dtype=np.uint8)  # stable black anchor
+    # Stable luma-based partition: darkest 16 colours → base (Layer 1, opaque),
+    # brightest 15 colours → overlay (Layer 2, index 0 transparent).
+    # Luma is intrinsic to the KMeans centroid values and changes slowly frame-to-frame.
+    # Frequency-count ordering causes colours near the rank-15/16 boundary to swap layers
+    # every frame (their counts differ by < 1%), producing the alternating top/bottom noise.
+    luma_32 = (0.299 * pal32[:, 0].astype(np.float32)
+             + 0.587 * pal32[:, 1].astype(np.float32)
+             + 0.114 * pal32[:, 2].astype(np.float32))
+    luma_order = np.argsort(luma_32)
+    palette2_rgb = stable_sort_palette(pal32[luma_order[:COLOURS]])
     palette1_rgb = np.zeros((COLOURS, 3), dtype=np.uint8)
-    palette1_rgb[1:] = stable_sort_palette(pal32[pal1_global_idx])
+    palette1_rgb[1:] = stable_sort_palette(pal32[luma_order[COLOURS:COLOURS + VISIBLE_OVERLAY_COLOURS]])
 
     # Base gets nearest colour for every pixel.
     img2_idx, err2 = nearest_palette_indices(frame_rgb, palette2_rgb)
@@ -347,8 +361,7 @@ def encode_frame(
     # ----- Step 2: Base layer tile dictionary (256 tiles) -------------------
     tile_dict2, tile_map2 = find_tiles(img2_idx, NUM_TILES)
 
-    # Enforce a true all-black base tile and pin dark tile cells to it.
-    tile_dict2[0] = 0
+    # Pin dark tile cells to tile 0 (guaranteed all-zeros by find_tiles).
     if dark_lock_luma > 0.0:
         dark_tile_mask = dark_lock_mask.reshape(ROWS, TILE_H, COLS, TILE_W).mean(axis=(1, 3)) > 0.70
         tile_map2 = np.where(dark_tile_mask, 0, tile_map2).astype(np.uint8)
@@ -357,8 +370,7 @@ def encode_frame(
     # Use the same per-pixel quantization but remapped to palette1 indices.
     tile_dict1, tile_map1 = find_tiles(img1_idx, NUM_TILES)
 
-    # Enforce a true transparent overlay tile and pin sparse overlay cells to it.
-    tile_dict1[0] = 0
+    # Pin sparse overlay cells to tile 0 (guaranteed all-zeros by find_tiles).
     ov_tile_cov = (img1_idx.reshape(ROWS, TILE_H, COLS, TILE_W) > 0).mean(axis=(1, 3))
     tile_map1 = np.where(ov_tile_cov < 0.18, 0, tile_map1).astype(np.uint8)
 

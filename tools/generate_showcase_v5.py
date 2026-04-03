@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 
 import numpy as np
-from sklearn.cluster import MiniBatchKMeans
+from sklearn.cluster import KMeans
 
 
 SCREEN_W = 320
@@ -123,7 +123,6 @@ def make_overlay_palette_v5() -> np.ndarray:
         (252, 252, 252),
     ], dtype=np.uint8)
 
-
 def find_tiles(indexed_img: np.ndarray, n_tiles: int) -> tuple[np.ndarray, np.ndarray]:
     """Cluster 1200 8x8 patches to n_tiles dictionary and tile map."""
     tiles = []
@@ -139,9 +138,8 @@ def find_tiles(indexed_img: np.ndarray, n_tiles: int) -> tuple[np.ndarray, np.nd
         tile_dict[:len(unique_tiles)] = unique_tiles.reshape(-1, TILE_H, TILE_W).astype(np.uint8)
         return tile_dict, inverse_indices.reshape(ROWS, COLS).astype(np.uint8)
 
-    km = MiniBatchKMeans(n_clusters=n_tiles, n_init=3, max_iter=60, random_state=42, batch_size=512)
-    km.fit(tiles_arr)
-    tile_ids = km.predict(tiles_arr)
+    km = KMeans(n_clusters=n_tiles, n_init=1, max_iter=30, random_state=42)
+    tile_ids = km.fit_predict(tiles_arr)
 
     centres = km.cluster_centers_.astype(np.float32)
     tile_dict = np.zeros((n_tiles, TILE_H, TILE_W), dtype=np.uint8)
@@ -160,9 +158,9 @@ def find_tiles(indexed_img: np.ndarray, n_tiles: int) -> tuple[np.ndarray, np.nd
 
 
 def generate_base_highres_v5(frame_idx: int, ball_x: float, ball_y: float, ball_r: float) -> np.ndarray:
-    """Render sky, perspective floor, and shadow into a 320x240 index image (0-15)."""
-    y = np.arange(SCREEN_H, dtype=np.float32)[:, None]
-    x = np.arange(SCREEN_W, dtype=np.float32)[None, :]
+    """Render sky, perspective floor, and shadow into a 160x120 index image (0-15)."""
+    y = np.arange(0, SCREEN_H, 2, dtype=np.float32)[:, None]
+    x = np.arange(0, SCREEN_W, 2, dtype=np.float32)[None, :]
 
     horizon = 94.0 + 3.0 * np.sin(frame_idx * 0.012)
 
@@ -198,8 +196,8 @@ def generate_base_highres_v5(frame_idx: int, ball_x: float, ball_y: float, ball_
 
 
 def generate_overlay_highres_v5(frame_idx: int) -> tuple[np.ndarray, float, float, float]:
-    """Render bouncing checker sphere into overlay index image (0 transparent, 1-15 visible)."""
-    img = np.zeros((SCREEN_H, SCREEN_W), dtype=np.uint8)
+    """Render bouncing checker sphere into 160x120 overlay index image (0 transparent, 1-15 visible)."""
+    img = np.zeros((SCREEN_H // 2, SCREEN_W // 2), dtype=np.uint8)
 
     t = frame_idx / 24.0
     # Horizontal motion + slight drift.
@@ -215,8 +213,8 @@ def generate_overlay_highres_v5(frame_idx: int) -> tuple[np.ndarray, float, floa
     stretch = np.exp(-((bounce - 1.0) / 0.25)**2)
     ball_r = 28.0 * (1.0 - 0.10 * contact + 0.06 * stretch)
 
-    x = np.arange(SCREEN_W, dtype=np.float32)
-    y = np.arange(SCREEN_H, dtype=np.float32)
+    x = np.arange(0, SCREEN_W, 2, dtype=np.float32)
+    y = np.arange(0, SCREEN_H, 2, dtype=np.float32)
     X, Y = np.meshgrid(x, y)
     dx = X - ball_x
     dy = Y - ball_y
@@ -271,18 +269,25 @@ def generate_overlay_highres_v5(frame_idx: int) -> tuple[np.ndarray, float, floa
 
 def build_frame(frame_idx: int, fps: int) -> bytes:
     _ = fps  # animation speed is tuned for 24fps; keep arg for CLI compatibility
-    palette_overlay = make_overlay_palette_v5()
-    overlay_img, bx, by, br = generate_overlay_highres_v5(frame_idx)
-    base_img = generate_base_highres_v5(frame_idx, bx, by, br)
+    
+    # 1. Generate 160x120 native index maps
+    overlay_img_binned, bx, by, br = generate_overlay_highres_v5(frame_idx)
+    base_img_binned = generate_base_highres_v5(frame_idx, bx, by, br)
+    
+    # 2. Expand to 320x240 (2x2 blocks)
+    # This preserves the massive tile-budget savings of the binned approach,
+    # guaranteeing we hit the np.unique fast-path, while perfectly retaining
+    # the native dual-layer transparency of the Amiga Ball scene!
+    base_img = np.repeat(np.repeat(base_img_binned, 2, axis=0), 2, axis=1)
+    overlay_img = np.repeat(np.repeat(overlay_img_binned, 2, axis=0), 2, axis=1)
 
+    # 3. Cluster directly on the native palette indices
     base_tiles, base_map = find_tiles(base_img, NUM_TILES)
     over_tiles, over_map = find_tiles(overlay_img, NUM_TILES)
 
-    palette_base = make_base_palette_v5()
-
     return (
-        palette_to_bytes(palette_base)                             # base palette    → Layer 1 slot
-        + palette_to_bytes(palette_overlay, transparent_index0=True)  # overlay palette → Layer 2 slot
+        palette_to_bytes(make_base_palette_v5())                      # base palette    → Layer 1 slot
+        + palette_to_bytes(make_overlay_palette_v5(), transparent_index0=True)  # overlay palette → Layer 2 slot
         + build_tileset(over_tiles)                               # overlay tiles   → Layer 2 slot
         + build_tileset(base_tiles)                               # base tiles      → Layer 1 slot
         + bytes(over_map.flatten())                               # overlay map     → Layer 2 slot
