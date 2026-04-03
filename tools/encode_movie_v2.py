@@ -19,6 +19,7 @@ import time
 
 import cv2
 import numpy as np
+from PIL import Image
 from sklearn.cluster import KMeans, MiniBatchKMeans
 
 SCREEN_W = 320
@@ -29,6 +30,7 @@ COLS = SCREEN_W // TILE_W
 ROWS = SCREEN_H // TILE_H
 NUM_TILES = 256
 COLOURS = 16
+FRAME_BYTES = 18848
 
 HEADER_MAGIC = b"MT62"
 HEADER_VERSION = 1
@@ -98,9 +100,16 @@ def find_tiles(indexed_img: np.ndarray, n_tiles: int) -> tuple[np.ndarray, np.nd
     
     tiles_arr = np.array(tiles, dtype=np.float32)
 
+    unique_tiles, inverse_indices = np.unique(tiles_arr, axis=0, return_inverse=True)
+    if len(unique_tiles) <= n_tiles:
+        tile_dict = np.zeros((n_tiles, TILE_H, TILE_W), dtype=np.uint8)
+        tile_dict[:len(unique_tiles)] = unique_tiles.reshape(-1, TILE_H, TILE_W).astype(np.uint8)
+        return tile_dict, inverse_indices.reshape(ROWS, COLS).astype(np.uint8)
+
     # MiniBatch is much faster for the 1200 tile blocks than standard KMeans
-    km = MiniBatchKMeans(n_clusters=n_tiles, n_init=1, random_state=42, max_iter=10)
-    tile_ids = km.fit_predict(tiles_arr)
+    km = MiniBatchKMeans(n_clusters=n_tiles, n_init=3, random_state=42, max_iter=50, batch_size=512)
+    km.fit(tiles_arr)
+    tile_ids = km.predict(tiles_arr)
     centres = km.cluster_centers_
 
     tile_dict = np.zeros((n_tiles, TILE_H, TILE_W), dtype=np.uint8)
@@ -128,8 +137,8 @@ def encode_frame(frame_bgr: np.ndarray, prev_centers=None) -> tuple[bytes, np.nd
     # 2. Color Quantization with Temporal Stability (reduces frame-to-frame flicker)
     init_centers = prev_centers if prev_centers is not None else 'k-means++'
     km = KMeans(n_clusters=32, n_init=1, init=init_centers, random_state=42)
-    labels = km.fit_predict(pixels)
-    raw_centers = km.cluster_centers_
+    km.fit(pixels)
+    raw_centers = km.cluster_centers_.copy()
     centers = raw_centers.clip(0, 255).astype(np.uint8)
 
     # Stable partition: sort all 32 colors by luma and split at the midpoint.

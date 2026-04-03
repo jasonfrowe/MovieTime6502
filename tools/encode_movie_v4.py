@@ -15,6 +15,7 @@ import time
 
 import cv2
 import numpy as np
+from PIL import Image
 from sklearn.cluster import KMeans, MiniBatchKMeans
 
 SCREEN_W = 320
@@ -351,6 +352,7 @@ def cmd_verify(args):
         magic, version, fps, w, h, tw, th, frame_count = struct.unpack("<4sBBHHHHI", hdr)
         print(f"Magic: {magic}  Version: {version}  FPS: {fps}")
         print(f"Resolution: {w}x{h}  Tile: {tw}x{th}  Frames: {frame_count}")
+        pil_frames = []
         for i in range(min(args.frames, frame_count)):
             data = f.read(FRAME_BYTES)
             if len(data) < FRAME_BYTES:
@@ -359,7 +361,16 @@ def cmd_verify(args):
             img = reconstruct_frame(data)
             out_path = os.path.join(args.debug_dir, f"frame_{i:04d}.png")
             cv2.imwrite(out_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+            pil_frames.append(Image.fromarray(img))
             print(f"  Saved {out_path}")
+            
+        if pil_frames:
+            gif_path = os.path.join(args.debug_dir, "animation.gif")
+            pil_frames[0].save(
+                gif_path, save_all=True, append_images=pil_frames[1:],
+                duration=int(1000 / fps) if fps > 0 else 41, loop=0
+            )
+            print(f"\nSaved animated GIF to {gif_path}")
 
 
 def main():
