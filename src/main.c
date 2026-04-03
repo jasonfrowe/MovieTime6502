@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <time.h>
 #include "constants.h"
+#include "input.h"
 
 // Provide argv storage so RP6502 C runtime can populate argc/argv.
 // Without this hook, argc can be 0 even when launch arguments are supplied.
@@ -185,6 +186,8 @@ int main(int argc, char *argv[])
     puts("Debug view: NORMAL");
 #endif
 
+    init_input();
+
     if (!init_graphics()) {
         puts("Graphics init failed");
         return 1;
@@ -239,10 +242,70 @@ int main(int argc, char *argv[])
     t_start      = clock();
     vsync_last   = RIA.vsync;
 
+    bool paused = false;
+
     unsigned read_buffer = BUFFER0_BASE;
     unsigned disp_buffer = BUFFER1_BASE;
 
     for (frame_idx = 0; frame_idx < frame_count; frame_idx++) {
+
+        // -- Poll input at the start of every frame -------------------------
+        poll_input();
+
+        // STOP — exit playback immediately
+        if (action_pressed(ACTION_STOP)) {
+            puts("Stopped.");
+            break;
+        }
+
+        // PLAY/PAUSE toggle
+        if (action_pressed(ACTION_PLAY_PAUSE)) {
+            paused = !paused;
+            puts(paused ? "Paused." : "Playing.");
+        }
+
+        // FAST FORWARD — skip ahead SKIP_FRAMES frames
+        if (action_held(ACTION_FAST_FORWARD) && !paused) {
+            long skip_bytes = (long)FRAME_BYTES * SKIP_FRAMES;
+            if (lseek(fd, skip_bytes, SEEK_CUR) < 0) {
+                // Reached or passed end — let the read below handle termination
+                lseek(fd, 0, SEEK_END);
+            } else {
+                frame_idx += SKIP_FRAMES;
+                if (frame_idx >= frame_count)
+                    frame_idx = frame_count - 1;
+            }
+            cadence_pos = 0;
+        }
+
+        // REWIND — seek back SKIP_FRAMES frames (clamped to start)
+        if (action_held(ACTION_REWIND) && !paused) {
+            long skip_bytes = (long)FRAME_BYTES * (SKIP_FRAMES + 1);
+            long cur = lseek(fd, 0, SEEK_CUR);
+            long target = cur - skip_bytes;
+            long data_start = (long)HEADER_BYTES;
+            if (target < data_start) target = data_start;
+            lseek(fd, target, SEEK_SET);
+            // Recalculate frame_idx from file position
+            frame_idx = (uint32_t)((target - data_start) / FRAME_BYTES);
+            cadence_pos = 0;
+        }
+
+        // Pause loop — keep displaying the last frame, still polling input
+        while (paused) {
+            wait_vsync();
+            poll_input();
+            if (action_pressed(ACTION_PLAY_PAUSE)) {
+                paused = false;
+                puts("Playing.");
+            }
+            if (action_pressed(ACTION_STOP)) {
+                paused = false;
+                frame_idx = frame_count; // signal loop termination after while
+                break;
+            }
+        }
+        if (frame_idx >= frame_count) break;
 
         // -- Stream entire frame directly from USB → XRAM (18,848 bytes) -----
         n = read_xram(read_buffer, FRAME_BYTES, fd);

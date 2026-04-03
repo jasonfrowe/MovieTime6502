@@ -29,4 +29,26 @@ rp6502_executable(MovieTime6502
 
 target_sources(MovieTime6502 PRIVATE
     src/main.c
+    src/input.c
+)
+
+# ---------------------------------------------------------------------------
+# MovieTime6502_lb — ML62 low-bandwidth USB stream player
+# Tile dictionaries (tiles1.bin, tiles2.bin) are embedded in the ROM.
+# Only palette+map data (2,464 bytes/frame) is streamed from USB,
+# giving ~8× bandwidth reduction vs the full MT62 player.
+# ---------------------------------------------------------------------------
+
+add_executable(MovieTime6502_lb)
+rp6502_asset(MovieTime6502_lb help lb/help_lb.txt)
+rp6502_asset(MovieTime6502_lb tiles1.bin images/tiles1.bin)
+rp6502_asset(MovieTime6502_lb tiles2.bin images/tiles2.bin)
+
+rp6502_executable(MovieTime6502_lb
+    DATA file
+    RESET file
+)
+
+target_sources(MovieTime6502_lb PRIVATE
+    lb/MovieTime6502_lb.c
 )

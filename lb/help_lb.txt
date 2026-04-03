@@ -1,0 +1,16 @@
+MovieTime6502_lb — Low-Bandwidth ML62 Video Player
+
+Plays ML62-format video streams on the Picocomputer RP6502.
+Requires three files on the USB root:
+
+  TILES1.BIN   Fixed base-layer    tile dictionary (8,192 bytes).
+  TILES2.BIN   Fixed overlay-layer tile dictionary (8,192 bytes).
+  MOVIE.BIN    ML62 video stream (or supply a filename as an argument).
+
+Tile files are loaded once at startup; only palette + tilemap data
+(2,464 bytes/frame) is streamed — an ~8× bandwidth reduction vs MT62.
+
+Generate tile files and encode a clip with the Python encoder:
+  python tools/encode_movie_lb.py generate-tiles --out-dir /usb
+  python tools/encode_movie_lb.py encode \
+      --input video.mp4 --output /usb/MOVIE.BIN --write-tiles

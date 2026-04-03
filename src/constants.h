@@ -72,4 +72,8 @@
 // Cadence table length (24 fps on 60 Hz: 2-3-2-3-2 pattern)
 #define CADENCE_LEN     5U
 
+// Number of frames to skip/rewind per fast-forward / rewind hold.
+// At 24 fps, 24 = 1 second jump per input poll cycle.
+#define SKIP_FRAMES     24U
+
 #endif // CONSTANTS_H
