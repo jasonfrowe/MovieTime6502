@@ -29,6 +29,10 @@
 //   0x49A0 – 0x933F   Buffer 1
 //   0x9340 – 0x9353   tilemap1 config  (vga_mode2_config_t, 20 bytes)
 //   0x9354 – 0x9367   tilemap2 config  (vga_mode2_config_t, 20 bytes)
+//
+// V3C compact format adds a temporary scratch buffer for combined tile data:
+//   0x9368 – 0xB367   combined tiles   (8192 bytes, written by USB read_xram,
+//                                       then split in-place to both buffers)
 // ---------------------------------------------------------------------------
 
 #define BUFFER0_BASE        0x0000U
@@ -44,6 +48,9 @@
 
 #define TILEMAP1_CONFIG_ADDR 0x9340U
 #define TILEMAP2_CONFIG_ADDR 0x9354U
+
+// Scratch buffer for V3C combined tile data (sits above config structs)
+#define COMBINED_TILES_ADDR  0x9368U
 
 #define PALETTE_SIZE         32U
 
@@ -66,25 +73,20 @@
                       FRAME_MAP2_BYTES     + FRAME_MAP1_BYTES)
 // = 18,848
 
-// Total bytes per frame — MT62 v2 / V3C half-tile (10,656 bytes)
-// Layout: pal1(32) + pal2(32) + overlay_tiles128(4096) + base_tiles128(4096) + map2(1200) + map1(1200)
-// Uses 128 tiles per layer instead of 256, eliminating any CPU-side tile processing.
-// Tile IDs in both maps are 0-127 only; XRAM tile slots 128-255 are unused.
-#define FRAME_TILES_V3C_BYTES   4096U  // 128 tiles × 32 bytes per layer
+// Total bytes per frame — MT62 v2 / V3C compact (combined tile block, 10,656 bytes)
+// Layout: pal1(32) + pal2(32) + combined_tiles(8192) + map2(1200) + map1(1200)
+// combined_tiles[i] = (base_tiles[i] & 0x0F) | (overlay_tiles[i] & 0xF0)
+// lo nibble = base layer even-column pixel, hi nibble = overlay layer odd-column pixel
 #define FRAME_BYTES_V3C  (FRAME_PALETTE1_BYTES + FRAME_PALETTE2_BYTES + \
-                          FRAME_TILES_V3C_BYTES + FRAME_TILES_V3C_BYTES + \
-                          FRAME_MAP2_BYTES + FRAME_MAP1_BYTES)
+                          8192U + FRAME_MAP2_BYTES + FRAME_MAP1_BYTES)
 // = 10,656
-
-// Maximum tile ID written to maps in V3C format (0-based, inclusive)
-#define V3C_NUM_TILES  128U
 
 // File header size
 #define HEADER_BYTES    18U
 
 // MT62 file format version bytes
-#define MT62_VERSION_V1   1U  // separate 256-tile blocks per layer (18,848 bytes/frame)
-#define MT62_VERSION_V3C  2U  // 128-tile blocks per layer, no split (10,656 bytes/frame)
+#define MT62_VERSION_V1   1U  // separate tile blocks (18,848 bytes/frame)
+#define MT62_VERSION_V3C  2U  // combined tile block  (10,656 bytes/frame)
 
 // Number of frames to skip/rewind per fast-forward / rewind hold.
 // At 24 fps, 24 = 1 second jump per input poll cycle.

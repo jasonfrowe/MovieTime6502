@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """
-encode_movie_v3c.py — V3C Half-Tile Encoder for MovieTime6502.
+encode_movie_v3c.py — V3C Compact Tile Encoder for MovieTime6502.
 
-V3C builds on V3's spatial striping scheme but uses 128 tiles per layer
-instead of 256, halving the tile data from 16,384 to 8,192 bytes per frame
-and dropping total USB bandwidth from 441 KB/s (V1/V3) to 249 KB/s at 24 fps.
+V3C builds on V3's spatial striping scheme but packs both tile layers into a
+single 8192-byte tile block, halving the USB transfer from 18,848 to 10,656
+bytes per frame (441 KB/s → 249 KB/s at 24 fps).
 
-The key constraint of V3's column-striping means each layer's tile data is
-already half-information (half the nibbles are always zero), so 128 tiles
-provide sufficient visual quality for natural video content.
+V3 encodes two tile layers with complementary nibble sparsity:
+  base tiles:    hi nibble = 0  (odd  screen columns locked to palette index 0)
+  overlay tiles: lo nibble = 0  (even screen columns locked to transparent)
 
-The player reads each tile block directly into its destination XRAM tile slot
-via read_xram—no CPU-side per-byte processing required.
+V3C exploits this by merging both layers into a single "combined" byte:
+  combined[i] = (base_tile[i] & 0x0F) | (overlay_tile[i] & 0xF0)
+
+The player splits the combined block back at decode time using the dual RIA
+XRAM portals (two register passes, ~20 ms at 8 MHz — fits in 33 ms budget).
 
 Frame layout on disk (10,656 bytes):
-  pal1(32)  pal2(32)  overlay_tiles_128(4096)  base_tiles_128(4096)  map2(1200)  map1(1200)
+  pal1(32)  pal2(32)  combined_tiles(8192)  map2(1200)  map1(1200)
 
-Map values are 0–127 (inclusive).  XRAM tile slots 128–255 are not referenced.
+On-device XRAM layout after split (same as V3 / original MT62 v1):
+  pal1  pal2  overlay_tiles  base_tiles  map2  map1
 """
 
 import argparse
@@ -36,7 +40,7 @@ TILE_W = 8
 TILE_H = 8
 COLS = SCREEN_W // TILE_W
 ROWS = SCREEN_H // TILE_H
-NUM_TILES = 128
+NUM_TILES = 256
 FRAME_BYTES = 10656
 
 HEADER_MAGIC = b"MT62"
@@ -181,27 +185,35 @@ def encode_frame(frame_bgr: np.ndarray, prev_centers=None) -> tuple[bytes, np.nd
     base_tiles, base_map = find_tiles(base_img_idx, NUM_TILES)
     overlay_tiles, overlay_map = find_tiles(ov_img_idx, NUM_TILES)
 
-    # 6. Binary Packing — V3C writes two separate 128-tile blocks (4096 bytes each)
+    # 6. Binary Packing — V3C combines both tile layers into one block
     pal1_bytes   = palette_to_bytes(base_palette)                             # base    -> Layer 1 slot
     pal2_bytes   = palette_to_bytes(overlay_palette, transparent_index0=True) # overlay -> Layer 2 slot
-    tiles2_bytes = build_tileset(list(overlay_tiles))                         # overlay -> Layer 2 slot  (128 tiles)
-    tiles1_bytes = build_tileset(list(base_tiles))                            # base    -> Layer 1 slot  (128 tiles)
+    tiles1_bytes = build_tileset(list(base_tiles))                            # base    -> Layer 1 slot
+    tiles2_bytes = build_tileset(list(overlay_tiles))                         # overlay -> Layer 2 slot
     map2_bytes   = bytes(overlay_map.flatten())                               # overlay -> Layer 2 slot
     map1_bytes   = bytes(base_map.flatten())                                  # base    -> Layer 1 slot
 
-    # Layout: pal1(32) + pal2(32) + overlay_tiles(4096) + base_tiles(4096) + map2(1200) + map1(1200) = 10,656
-    return pal1_bytes + pal2_bytes + tiles2_bytes + tiles1_bytes + map2_bytes + map1_bytes, raw_centers
+    # Merge tile data: lo nibble = base (even cols), hi nibble = overlay (odd cols)
+    # This is lossless because V3 spatial striping guarantees the complementary
+    # nibbles are always zero in each layer's encoded tile bytes.
+    combined_bytes = bytes((t1 & 0x0F) | (t2 & 0xF0) for t1, t2 in zip(tiles1_bytes, tiles2_bytes))
+
+    # Layout: pal1(32) + pal2(32) + combined_tiles(8192) + map2(1200) + map1(1200) = 10,656
+    return pal1_bytes + pal2_bytes + combined_bytes + map2_bytes + map1_bytes, raw_centers
 
 
 def reconstruct_frame(frame_bytes_data: bytes) -> np.ndarray:
-    """Decode a V3C packed frame back to an RGB image. Mimics the RP6502 VGA mode 2 hardware."""
+    """Decode a V3C packed frame back to an RGB image. Mimics the RP6502 split + VGA mode 2."""
     offset = 0
-    pal1_data   = frame_bytes_data[offset:offset + 32];   offset += 32
-    pal2_data   = frame_bytes_data[offset:offset + 32];   offset += 32
-    tiles2_data = frame_bytes_data[offset:offset + 4096]; offset += 4096  # 128 overlay tiles
-    tiles1_data = frame_bytes_data[offset:offset + 4096]; offset += 4096  # 128 base tiles
-    map2_data   = frame_bytes_data[offset:offset + 1200]; offset += 1200
-    map1_data   = frame_bytes_data[offset:offset + 1200]
+    pal1_data     = frame_bytes_data[offset:offset + 32];   offset += 32
+    pal2_data     = frame_bytes_data[offset:offset + 32];   offset += 32
+    combined_data = frame_bytes_data[offset:offset + 8192]; offset += 8192
+    map2_data     = frame_bytes_data[offset:offset + 1200]; offset += 1200
+    map1_data     = frame_bytes_data[offset:offset + 1200]
+
+    # Split combined block back into separate tile layers (mirrors split_combined_tiles in main.c)
+    tiles1_data = bytes(b & 0x0F for b in combined_data)  # base    (lo nibble)
+    tiles2_data = bytes(b & 0xF0 for b in combined_data)  # overlay (hi nibble)
 
     def parse_pal(data):
         colours = []
@@ -270,7 +282,7 @@ def cmd_encode(args):
 
     print(f"Encoding {args.input} to {args.output}")
     print(f"Clip: {args.start or '0'} -> {args.end or 'end'}")
-    print(f"Format: V3C half-tile ({NUM_TILES} tiles/layer, {FRAME_BYTES} bytes/frame, {FRAME_BYTES * args.fps / 1024:.0f} KB/s at {args.fps} fps)")
+    print(f"Format: V3C compact ({FRAME_BYTES} bytes/frame, {FRAME_BYTES * args.fps / 1024:.0f} KB/s at {args.fps} fps)")
     print(f"Targeting {args.fps} FPS, ~{total_target_frames} frames total.\n")
 
     with open(args.output, "wb") as fout:
