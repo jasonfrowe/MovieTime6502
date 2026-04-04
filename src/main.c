@@ -108,6 +108,35 @@ static bool init_graphics(void)
 // ---------------------------------------------------------------------------
 static uint8_t vsync_target;
 
+// ---------------------------------------------------------------------------
+// V3C combined tile split — expands the compact combined tile block into
+// separate base and overlay tile slots in the double-buffer.
+//
+// V3C encodes both tile layers into one byte per position:
+//   lo nibble (& 0x0F) = base layer tile pixel    (even screen columns only)
+//   hi nibble (& 0xF0) = overlay layer tile pixel  (odd  screen columns only)
+//
+// Two passes using both RIA XRAM portals.  At 8 MHz ≈ 20 ms total.
+// The base and overlay tile slots in the target buffer are written to
+// directly; the VGA still reads the current disp_buffer throughout, so
+// there is no visual glitch.
+// ---------------------------------------------------------------------------
+static void split_combined_tiles(unsigned src, unsigned base_dst, unsigned ov_dst)
+{
+    unsigned i;
+    uint8_t c;
+
+    /* Pass 1: lo nibble → base tile slot */
+    RIA.addr0 = src;      RIA.step0 = 1;
+    RIA.addr1 = base_dst; RIA.step1 = 1;
+    for (i = 0; i < 8192; i++) { c = RIA.rw0; RIA.rw1 = c & 0x0F; }
+
+    /* Pass 2: hi nibble → overlay tile slot (re-read src from start) */
+    RIA.addr0 = src;    RIA.step0 = 1;
+    RIA.addr1 = ov_dst; RIA.step1 = 1;
+    for (i = 0; i < 8192; i++) { c = RIA.rw0; RIA.rw1 = c & 0xF0; }
+}
+
 static void wait_for_target(void)
 {
     while ((int8_t)(RIA.vsync - vsync_target) < 0)
@@ -121,8 +150,10 @@ int main(int argc, char *argv[])
 {
     int fd;
     int i;
+    uint8_t  header_version;
     uint8_t  header_fps;
     uint32_t frame_count;
+    unsigned frame_bytes;
     uint32_t frame_idx;
     int      n;
     long     t_start, t_now;
@@ -204,13 +235,21 @@ int main(int argc, char *argv[])
             close(fd);
             return 1;
         }
-        header_fps  = hdr[5];
+        header_version = hdr[4];
+        header_fps     = hdr[5];
         // width/height at hdr[6..9], tile_w/tile_h at hdr[10..13] — informational
         frame_count = (uint32_t)hdr[14]
                 | ((uint32_t)hdr[15] << 8)
                 | ((uint32_t)hdr[16] << 16)
                 | ((uint32_t)hdr[17] << 24);
-        printf("FPS:%u  Frames:%lu\n", header_fps, (unsigned long)frame_count);
+        if (header_version != MT62_VERSION_V3C) {
+            printf("Unsupported version %u (need %u). Re-encode with encode_movie_v3c.py\n",
+                   header_version, MT62_VERSION_V3C);
+            close(fd);
+            return 1;
+        }
+        printf("FPS:%u  Frames:%lu  Ver:%u\n",
+               header_fps, (unsigned long)frame_count, header_version);
     }
 
     // Build the cadence table for the encoded fps.
@@ -218,6 +257,7 @@ int main(int argc, char *argv[])
     // If a different fps is stored, fall back to the nearest whole vsync count.
     // (Extension point - cadence selection by header_fps left for future work)
     (void)header_fps; // currently only 24fps cadence is built in
+    frame_bytes = FRAME_BYTES_V3C;
 
     // ---- Playback loop -------------------------------------------------------
     frames_shown = 0;
@@ -250,7 +290,7 @@ int main(int argc, char *argv[])
 
         // FAST FORWARD — skip ahead SKIP_FRAMES frames
         if (action_held(ACTION_FAST_FORWARD) && !paused) {
-            long skip_bytes = (long)FRAME_BYTES * SKIP_FRAMES;
+            long skip_bytes = (long)frame_bytes * SKIP_FRAMES;
             if (lseek(fd, skip_bytes, SEEK_CUR) < 0) {
                 // Reached or passed end — let the read below handle termination
                 lseek(fd, 0, SEEK_END);
@@ -263,14 +303,14 @@ int main(int argc, char *argv[])
 
         // REWIND — seek back SKIP_FRAMES frames (clamped to start)
         if (action_held(ACTION_REWIND) && !paused) {
-            long skip_bytes = (long)FRAME_BYTES * (SKIP_FRAMES + 1);
+            long skip_bytes = (long)frame_bytes * (SKIP_FRAMES + 1);
             long cur = lseek(fd, 0, SEEK_CUR);
             long target = cur - skip_bytes;
             long data_start = (long)HEADER_BYTES;
             if (target < data_start) target = data_start;
             lseek(fd, target, SEEK_SET);
             // Recalculate frame_idx from file position
-            frame_idx = (uint32_t)((target - data_start) / FRAME_BYTES);
+            frame_idx = (uint32_t)((target - data_start) / frame_bytes);
         }
 
         // Pause loop — keep displaying the last frame, still polling input
@@ -290,10 +330,20 @@ int main(int argc, char *argv[])
         }
         if (frame_idx >= frame_count) break;
 
-        // -- Stream entire frame directly from USB → XRAM (18,848 bytes) -----
-        n = read_xram(read_buffer, FRAME_BYTES, fd);
-        if (n != FRAME_BYTES) break;
-        bytes_read += n;
+        // -- Stream V3C frame from USB → XRAM (10,656 bytes total) ------------
+        // 1. Palettes (64 bytes) → directly into frame buffer
+        n  = read_xram(read_buffer + OFFSET_PAL_BASE,     64,   fd);
+        // 2. Combined tile block (8192 bytes) → scratch buffer
+        n += read_xram(COMBINED_TILES_ADDR,              8192,  fd);
+        // 3. Both maps (2400 bytes) → directly into frame buffer
+        n += read_xram(read_buffer + OFFSET_MAP_OVERLAY, 2400,  fd);
+        if (n != (int)frame_bytes) break;
+        bytes_read += (uint32_t)n;
+
+        // 4. Expand combined tiles into separate base + overlay tile slots
+        split_combined_tiles(COMBINED_TILES_ADDR,
+                             read_buffer + OFFSET_TILES_BASE,
+                             read_buffer + OFFSET_TILES_OVERLAY);
 
         // -- Wait for target vsync then swap buffers ------------------------
         // Late frames may cause a scanline of garbage
