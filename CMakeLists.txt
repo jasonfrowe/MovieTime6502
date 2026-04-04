@@ -30,6 +30,7 @@ rp6502_executable(MovieTime6502
 target_sources(MovieTime6502 PRIVATE
     src/main.c
     src/input.c
+    src/read_xram_split.c
 )
 
 # ---------------------------------------------------------------------------

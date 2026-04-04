@@ -60,11 +60,23 @@
 #define FRAME_MAP2_BYTES        1200U  // 40×30 tile IDs, base layer
 #define FRAME_MAP1_BYTES        1200U  // 40×30 tile IDs, overlay layer
 
-// Total bytes per frame
+// Total bytes per frame — MT62 v1 (two separate 256-tile blocks, 18,848 bytes)
 #define FRAME_BYTES  (FRAME_PALETTE1_BYTES + FRAME_PALETTE2_BYTES + \
                       FRAME_TILES2_BYTES   + FRAME_TILES1_BYTES   + \
                       FRAME_MAP2_BYTES     + FRAME_MAP1_BYTES)
 // = 18,848
+
+// Total bytes per frame — MT62 v2 / V3C (combined tile block, 10,656 bytes)
+// Disk layout: pal1(32) + pal2(32) + combined_tiles(8192) + map2(1200) + map1(1200)
+// combined_tiles[i] = (base_tiles[i] & 0x0F) | (overlay_tiles[i] & 0xF0)
+// The Pico splits combined_tiles into separate XRAM tile slots via opcode 0x2F.
+#define FRAME_BYTES_V3C  (FRAME_PALETTE1_BYTES + FRAME_PALETTE2_BYTES + \
+                          8192U + FRAME_MAP2_BYTES + FRAME_MAP1_BYTES)
+// = 10,656
+
+// MT62 file format version bytes
+#define MT62_VERSION_V1   1U  // two separate tile blocks (18,848 bytes/frame)
+#define MT62_VERSION_V3C  2U  // combined tile block, Pico-split (10,656 bytes/frame)
 
 // File header size
 #define HEADER_BYTES    18U
