@@ -102,30 +102,16 @@ static bool init_graphics(void)
 #endif
 
 // ---------------------------------------------------------------------------
-// Cadence table for 24 fps presentation on a 60 Hz display.
-// 60/24 = 2.5 vsyncs per frame, so we alternate 2 and 3 vsyncs.
-// 5-entry repeating cycle: 2,3,2,3,2 = 12 vsyncs = 5 frames (200ms)
-// Each entry is the number of extra vsyncs to hold (0 = show on next vsync).
+// Vsync helpers — 3:2 pulldown for 24 fps on 60 Hz.
+// Even film frames are held 2 display vsyncs, odd frames 3 (avg 2.5).
+// vsync_target is the absolute RIA.vsync counter value at which to swap.
 // ---------------------------------------------------------------------------
-static const uint8_t cadence_24[CADENCE_LEN] = {2, 3, 2, 3, 2};
+static uint8_t vsync_target;
 
-// ---------------------------------------------------------------------------
-// Vsync spin helpers
-// ---------------------------------------------------------------------------
-static uint8_t vsync_last;
-
-static void wait_vsync(void)
+static void wait_for_target(void)
 {
-    while (RIA.vsync == vsync_last)
+    while ((int8_t)(RIA.vsync - vsync_target) < 0)
         ;
-    vsync_last = RIA.vsync;
-}
-
-static void wait_vsyncs(uint8_t n)
-{
-    uint8_t i;
-    for (i = 0; i < n; i++)
-        wait_vsync();
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +124,6 @@ int main(int argc, char *argv[])
     uint8_t  header_fps;
     uint32_t frame_count;
     uint32_t frame_idx;
-    uint8_t  cadence_pos;
     int      n;
     long     t_start, t_now;
     uint32_t frames_shown;
@@ -235,12 +220,11 @@ int main(int argc, char *argv[])
     (void)header_fps; // currently only 24fps cadence is built in
 
     // ---- Playback loop -------------------------------------------------------
-    cadence_pos  = 0;
     frames_shown = 0;
     bytes_read   = 0;
     late_frames  = 0;
     t_start      = clock();
-    vsync_last   = RIA.vsync;
+    vsync_target = RIA.vsync + 1;
 
     bool paused = false;
 
@@ -275,7 +259,6 @@ int main(int argc, char *argv[])
                 if (frame_idx >= frame_count)
                     frame_idx = frame_count - 1;
             }
-            cadence_pos = 0;
         }
 
         // REWIND — seek back SKIP_FRAMES frames (clamped to start)
@@ -288,12 +271,12 @@ int main(int argc, char *argv[])
             lseek(fd, target, SEEK_SET);
             // Recalculate frame_idx from file position
             frame_idx = (uint32_t)((target - data_start) / FRAME_BYTES);
-            cadence_pos = 0;
         }
 
         // Pause loop — keep displaying the last frame, still polling input
         while (paused) {
-            wait_vsync();
+            vsync_target = RIA.vsync + 1;
+            wait_for_target();
             poll_input();
             if (action_pressed(ACTION_PLAY_PAUSE)) {
                 paused = false;
@@ -312,11 +295,19 @@ int main(int argc, char *argv[])
         if (n != FRAME_BYTES) break;
         bytes_read += n;
 
-        // -- Wait for vsync then swap buffers and advance cadence -----------
-        wait_vsync();
-
+        // -- Wait for target vsync then swap buffers ------------------------
+        // Late frames may cause a scanline of garbage
+        // Advance target: even frames 2 vsyncs, odd frames 3 (3:2 pulldown = 24 fps)
+        uint8_t next_vsync_frames = (frame_idx & 1) ? 3 : 2;
         disp_buffer = read_buffer;
         read_buffer = (disp_buffer == BUFFER0_BASE) ? BUFFER1_BASE : BUFFER0_BASE;
+        if ((int8_t)(RIA.vsync - vsync_target) >= 0) {
+            vsync_target++;
+            next_vsync_frames--;
+            late_frames++;
+        }
+        wait_for_target();
+        vsync_target = RIA.vsync + next_vsync_frames;
 
         // Apply new pointers immediately to live config structs
         xram0_struct_set(tilemap1_cfg, vga_mode2_config_t, xram_palette_ptr, (disp_buffer + OFFSET_PAL_BASE));
@@ -326,6 +317,7 @@ int main(int argc, char *argv[])
         xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, xram_palette_ptr, (disp_buffer + OFFSET_PAL_OVERLAY));
         xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, xram_tile_ptr,    (disp_buffer + OFFSET_TILES_OVERLAY));
         xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, xram_data_ptr,    (disp_buffer + OFFSET_MAP_OVERLAY));
+
 
     #if DEBUG_VIEW_MODE == DEBUG_VIEW_BASE_ONLY
         // Force top overlay layer palette fully transparent.
@@ -348,16 +340,6 @@ int main(int argc, char *argv[])
         }
     #endif
 
-        // Hold for remaining vsyncs in the cadence slot
-        {
-            uint8_t hold = cadence_24[cadence_pos];
-            if (cadence_pos + 1 < CADENCE_LEN)
-                cadence_pos++;
-            else
-                cadence_pos = 0;
-            if (hold > 1)
-                wait_vsyncs(hold - 1);
-        }
 
         frames_shown++;
 
