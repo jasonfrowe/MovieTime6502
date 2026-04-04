@@ -179,6 +179,30 @@ python tools/generate_showcase_v5.py \
 3. Upload and run `MovieTime6502.rp6502`.
 4. The player prints FPS and KB/s throughput stats every two seconds.
 
+### Controls
+
+| Action | Keyboard | Gamepad |
+|--------|----------|---------|
+| Play / Pause | `Space` or `Enter` | START |
+| Stop (exit) | `Esc` or `Q` | SELECT |
+| Fast Forward | `→` or `L` | D-Pad Right / R1 |
+| Rewind | `←` or `J` | D-Pad Left / L1 |
+
+Fast Forward and Rewind jump ~1 second (24 frames) per poll cycle while held.
+Both are disabled while paused.
+
+Gamepad button assignments can be remapped without recompiling by placing a
+`JOYSTICK_CA.DAT` (preferred) or `JOYSTICK.DAT` file in the root of the USB
+drive. The file format is identical to the one used by RPMegaRaider:
+
+```
+1 byte    num_mappings
+N × 3 bytes  { uint8_t action_id, uint8_t field, uint8_t mask }
+```
+
+`action_id` values: `0` = Play/Pause, `1` = Stop, `2` = Fast Forward, `3` = Rewind.  
+`field` values: `0` = D-Pad, `1` = Sticks, `2` = BTN0 (face/shoulders), `3` = BTN1 (triggers/select/start).
+
 ---
 
 ## MT62 Stream Format
