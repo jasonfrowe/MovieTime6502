@@ -16,7 +16,7 @@
 // ---------------------------------------------------------------------------
 // XRAM layout  (all addresses within the 64 KB XRAM window)
 //
-// MovieTime6502 uses full double buffering.
+// MovieTime6502 uses full double buffering. 
 // Each frame buffer exactly matches the 18,848 byte MT62 file frame layout:
 //   [0]     palette1   32 bytes   (Base Layer)
 //   [32]    palette2   32 bytes   (Overlay Layer)
@@ -29,10 +29,6 @@
 //   0x49A0 – 0x933F   Buffer 1
 //   0x9340 – 0x9353   tilemap1 config  (vga_mode2_config_t, 20 bytes)
 //   0x9354 – 0x9367   tilemap2 config  (vga_mode2_config_t, 20 bytes)
-//
-// V3C compact format adds a temporary scratch buffer for combined tile data:
-//   0x9368 – 0xB367   combined tiles   (8192 bytes, written by USB read_xram,
-//                                       then split in-place to both buffers)
 // ---------------------------------------------------------------------------
 
 #define BUFFER0_BASE        0x0000U
@@ -49,9 +45,6 @@
 #define TILEMAP1_CONFIG_ADDR 0x9340U
 #define TILEMAP2_CONFIG_ADDR 0x9354U
 
-// Scratch buffer for V3C combined tile data (sits above config structs)
-#define COMBINED_TILES_ADDR  0x9368U
-
 #define PALETTE_SIZE         32U
 
 // ---------------------------------------------------------------------------
@@ -67,26 +60,14 @@
 #define FRAME_MAP2_BYTES        1200U  // 40×30 tile IDs, base layer
 #define FRAME_MAP1_BYTES        1200U  // 40×30 tile IDs, overlay layer
 
-// Total bytes per frame — MT62 v1 (separate tile blocks, 18,848 bytes)
+// Total bytes per frame
 #define FRAME_BYTES  (FRAME_PALETTE1_BYTES + FRAME_PALETTE2_BYTES + \
                       FRAME_TILES2_BYTES   + FRAME_TILES1_BYTES   + \
                       FRAME_MAP2_BYTES     + FRAME_MAP1_BYTES)
 // = 18,848
 
-// Total bytes per frame — MT62 v2 / V3C compact (combined tile block, 10,656 bytes)
-// Layout: pal1(32) + pal2(32) + combined_tiles(8192) + map2(1200) + map1(1200)
-// combined_tiles[i] = (base_tiles[i] & 0x0F) | (overlay_tiles[i] & 0xF0)
-// lo nibble = base layer even-column pixel, hi nibble = overlay layer odd-column pixel
-#define FRAME_BYTES_V3C  (FRAME_PALETTE1_BYTES + FRAME_PALETTE2_BYTES + \
-                          8192U + FRAME_MAP2_BYTES + FRAME_MAP1_BYTES)
-// = 10,656
-
 // File header size
 #define HEADER_BYTES    18U
-
-// MT62 file format version bytes
-#define MT62_VERSION_V1   1U  // separate tile blocks (18,848 bytes/frame)
-#define MT62_VERSION_V3C  2U  // combined tile block  (10,656 bytes/frame)
 
 // Number of frames to skip/rewind per fast-forward / rewind hold.
 // At 24 fps, 24 = 1 second jump per input poll cycle.
