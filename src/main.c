@@ -297,11 +297,17 @@ int main(int argc, char *argv[])
 
         // -- Wait for target vsync then swap buffers ------------------------
         // Late frames may cause a scanline of garbage
+        // Advance target: even frames 2 vsyncs, odd frames 3 (3:2 pulldown = 24 fps)
+        uint8_t next_vsync_frames = (frame_idx & 1) ? 3 : 2;
         disp_buffer = read_buffer;
         read_buffer = (disp_buffer == BUFFER0_BASE) ? BUFFER1_BASE : BUFFER0_BASE;
-        if ((int8_t)(RIA.vsync - vsync_target) >= 0) 
+        if ((int8_t)(RIA.vsync - vsync_target) >= 0) {
+            vsync_target++;
+            next_vsync_frames--;
             late_frames++;
+        }
         wait_for_target();
+        vsync_target = RIA.vsync + next_vsync_frames;
 
         // Apply new pointers immediately to live config structs
         xram0_struct_set(tilemap1_cfg, vga_mode2_config_t, xram_palette_ptr, (disp_buffer + OFFSET_PAL_BASE));
@@ -312,8 +318,6 @@ int main(int argc, char *argv[])
         xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, xram_tile_ptr,    (disp_buffer + OFFSET_TILES_OVERLAY));
         xram0_struct_set(tilemap2_cfg, vga_mode2_config_t, xram_data_ptr,    (disp_buffer + OFFSET_MAP_OVERLAY));
 
-        // Advance target: even frames 2 vsyncs, odd frames 3 (3:2 pulldown = 24 fps)
-        vsync_target = RIA.vsync + ((frame_idx & 1) ? 3 : 2);
 
     #if DEBUG_VIEW_MODE == DEBUG_VIEW_BASE_ONLY
         // Force top overlay layer palette fully transparent.
