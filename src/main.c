@@ -1,16 +1,30 @@
 /*
  * MovieTime6502 — MT62 stream player
  *
- * Reads MOVIE.BIN from USB mass storage and displays it using the
+ * Reads a movie file from USB mass storage and displays it using the
  * RP6502 VGA mode-2 tile renderer at the FPS encoded in the file header.
  *
- * Frame layout (18,848 bytes, fixed, matching encode_movie.py):
- *   32   bytes  palette1   (base layer,    16 × RGB555)
- *   32   bytes  palette2   (overlay layer, 16 × RGB555)
- *   8192 bytes  tiles2     (256 tiles, overlay layer)
- *   8192 bytes  tiles1     (256 tiles, base layer)
- *   1200 bytes  map2       (40×30 tile IDs, overlay layer)
- *   1200 bytes  map1       (40×30 tile IDs, base layer)
+ * Supported MT62 format versions (selected by header byte 4):
+ *
+ *   Version 1 — two separate tile blocks (18,848 bytes/frame):
+ *     32   bytes  palette1   (base layer,    16 × RGB555)
+ *     32   bytes  palette2   (overlay layer, 16 × RGB555)
+ *     8192 bytes  tiles1     (256 tiles, base layer)
+ *     8192 bytes  tiles2     (256 tiles, overlay layer)
+ *     1200 bytes  map1       (40×30 tile IDs, base layer)
+ *     1200 bytes  map2       (40×30 tile IDs, overlay layer)
+ *
+ *   Version 2 — V3C combined tile block (10,656 bytes/frame):
+ *     Requires custom RIA firmware (opcode 0x2F) and ENABLE_V3C build flag.
+ *     32   bytes  palette1   (base layer)
+ *     32   bytes  palette2   (overlay layer)
+ *     8192 bytes  combined_tiles  (lo nibble → base, hi nibble → overlay)
+ *     1200 bytes  map2       (overlay layer)
+ *     1200 bytes  map1       (base layer)
+ *     The Pico splits combined_tiles in-place at 125 MHz via read_xram_split.
+ *
+ *   Version 3 — reserved for LB (low-bandwidth) mode
+ *   Version 4+ — reserved for future schemes (256-colour single-plane, etc.)
  */
 
 #include <rp6502.h>
@@ -25,8 +39,11 @@
 #include "constants.h"
 #include "input.h"
 
-// Pico-side nibble-split read; defined in src/read_xram_split.c
+// Pico-side nibble-split read (opcode 0x2F); requires custom RIA firmware.
+// Only compiled when ENABLE_V3C is defined — e.g. the MovieTime6502_v3c target.
+#ifdef ENABLE_V3C
 int read_xram_split(unsigned base_dst, unsigned ov_dst, unsigned count, int fildes);
+#endif
 
 // Provide argv storage so RP6502 C runtime can populate argc/argv.
 // Without this hook, argc can be 0 even when launch arguments are supplied.
@@ -216,22 +233,32 @@ int main(int argc, char *argv[])
                 | ((uint32_t)hdr[15] << 8)
                 | ((uint32_t)hdr[16] << 16)
                 | ((uint32_t)hdr[17] << 24);
-        if (header_version != MT62_VERSION_V3C) {
-            printf("Unsupported version %u (need %u). Re-encode with encode_movie_v3c.py\n",
-                   header_version, MT62_VERSION_V3C);
-            close(fd);
-            return 1;
-        }
         printf("FPS:%u  Frames:%lu  Ver:%u\n",
                header_fps, (unsigned long)frame_count, header_version);
     }
 
+    // --- Version dispatch: set frame_bytes and validate ------------------------------
+    if (header_version == MT62_VERSION_V1) {
+        frame_bytes = FRAME_BYTES;
+    } else if (header_version == MT62_VERSION_V3C) {
+#ifndef ENABLE_V3C
+        puts("V3C (ver 2) requires custom firmware + ENABLE_V3C build.");
+        puts("Use MovieTime6502_v3c binary, or re-encode with encode_movie_v3.py.");
+        close(fd);
+        return 1;
+#else
+        frame_bytes = FRAME_BYTES_V3C;
+#endif
+    } else {
+        printf("Unknown version %u — cannot play.\n", header_version);
+        close(fd);
+        return 1;
+    }
+
     // Build the cadence table for the encoded fps.
     // For 24 fps we use the hard-coded 2-3-2-3-2 table above.
-    // If a different fps is stored, fall back to the nearest whole vsync count.
     // (Extension point - cadence selection by header_fps left for future work)
     (void)header_fps; // currently only 24fps cadence is built in
-    frame_bytes = FRAME_BYTES_V3C;
 
     // ---- Playback loop -------------------------------------------------------
     frames_shown = 0;
@@ -304,17 +331,25 @@ int main(int argc, char *argv[])
         }
         if (frame_idx >= frame_count) break;
 
-        // -- Stream V3C frame from USB → XRAM (10,656 bytes, 3 calls) -----------
-        // 1. Palettes: 64 bytes directly into the frame buffer.
-        n  = read_xram(read_buffer + OFFSET_PAL_BASE,      64,   fd);
-        // 2. Combined tile block: 8192 bytes from disk → Pico splits on the fly
-        //    into overlay tile slot (hi nibble) and base tile slot (lo nibble).
-        //    The split runs at 125 MHz on the Pico; zero 65C02 cycles spent.
-        n += read_xram_split(read_buffer + OFFSET_TILES_BASE,
-                             read_buffer + OFFSET_TILES_OVERLAY,
-                             8192, fd);
-        // 3. Both maps: 2400 bytes directly into the frame buffer.
-        n += read_xram(read_buffer + OFFSET_MAP_OVERLAY,   2400, fd);
+        // -- Stream frame from USB → XRAM ----------------------------------------
+#ifdef ENABLE_V3C
+        if (header_version == MT62_VERSION_V3C) {
+            // V3C: 10,656 bytes in 3 calls.
+            // 1. Palettes (64 bytes) directly into frame buffer.
+            n  = read_xram(read_buffer + OFFSET_PAL_BASE,     64,   fd);
+            // 2. Combined tile block (8,192 bytes): Pico splits lo/hi nibbles
+            //    in-place at 125 MHz via opcode 0x2F. Zero 65C02 cycles.
+            n += read_xram_split(read_buffer + OFFSET_TILES_BASE,
+                                 read_buffer + OFFSET_TILES_OVERLAY,
+                                 8192, fd);
+            // 3. Both maps (2,400 bytes) directly into frame buffer.
+            n += read_xram(read_buffer + OFFSET_MAP_OVERLAY,  2400, fd);
+        } else
+#endif
+        {
+            // V1: 18,848 bytes in a single call — frame layout matches XRAM exactly.
+            n = read_xram(read_buffer, (uint16_t)frame_bytes, fd);
+        }
         if (n != (int)frame_bytes) break;
         bytes_read += (uint32_t)n;
 

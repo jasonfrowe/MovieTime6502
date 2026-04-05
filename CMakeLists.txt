@@ -15,8 +15,9 @@ find_package(llvm-mos-sdk REQUIRED)
 project(MovieTime6502 C CXX ASM)
 
 # ---------------------------------------------------------------------------
-# MovieTime6502 — MT62 USB stream player
-# MOVIE.BIN is read at runtime from USB mass storage; no assets are embedded.
+# MovieTime6502 — MT62 USB stream player (stock firmware)
+# Plays MT62 version 1 files (18,848 bytes/frame, two tile blocks).
+# Runs on unmodified RP6502 firmware.
 # ---------------------------------------------------------------------------
 
 add_executable(MovieTime6502)
@@ -30,7 +31,31 @@ rp6502_executable(MovieTime6502
 target_sources(MovieTime6502 PRIVATE
     src/main.c
     src/input.c
+)
+
+# ---------------------------------------------------------------------------
+# MovieTime6502_v3c — MT62 USB stream player (custom firmware required)
+# Plays MT62 version 1 AND version 2 (V3C) files.
+# V3C: 10,656 bytes/frame via combined tile block split by Pico opcode 0x2F.
+# Requires RP6502 firmware with read_xram_split (opcode 0x2F) built in.
+# ---------------------------------------------------------------------------
+
+add_executable(MovieTime6502_v3c)
+rp6502_asset(MovieTime6502_v3c help src/help.txt)
+
+rp6502_executable(MovieTime6502_v3c
+    DATA file
+    RESET file
+)
+
+target_sources(MovieTime6502_v3c PRIVATE
+    src/main.c
+    src/input.c
     src/read_xram_split.c
+)
+
+target_compile_definitions(MovieTime6502_v3c PRIVATE
+    ENABLE_V3C=1
 )
 
 # ---------------------------------------------------------------------------

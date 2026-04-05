@@ -77,6 +77,8 @@
 // MT62 file format version bytes
 #define MT62_VERSION_V1   1U  // two separate tile blocks (18,848 bytes/frame)
 #define MT62_VERSION_V3C  2U  // combined tile block, Pico-split (10,656 bytes/frame)
+// 3U  — reserved for LB (low-bandwidth fixed-tile-dict) consolidation
+// 4U+ — reserved for future schemes (256-colour single-plane, etc.)
 
 // File header size
 #define HEADER_BYTES    18U
