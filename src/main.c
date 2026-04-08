@@ -261,6 +261,10 @@ int main(int argc, char *argv[])
     (void)header_fps; // currently only 24fps cadence is built in
 
     // ---- Playback loop -------------------------------------------------------
+    // Drain any held keys/buttons (e.g. the Enter used to launch the program)
+    // so they don't register as an immediate play/pause toggle on frame 1.
+    wait_for_input_release();
+
     frames_shown = 0;
     bytes_read   = 0;
     late_frames  = 0;

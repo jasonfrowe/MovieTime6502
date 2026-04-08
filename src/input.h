@@ -116,6 +116,7 @@ typedef enum {
 // ---------------------------------------------------------------------------
 void init_input(void);
 void poll_input(void);
+void wait_for_input_release(void);
 
 // Returns true when action transitions from not-pressed → pressed (edge).
 bool action_pressed(MediaAction action);

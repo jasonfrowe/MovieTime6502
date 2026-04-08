@@ -228,3 +228,36 @@ bool action_held(MediaAction action)
     return _raw_active(action, keystates, gamepad);
 }
 
+// Spin until every key and gamepad button is released.
+// Call this before starting input-driven playback to avoid spurious
+// edge-detects from the Enter/button press used to launch the program.
+void wait_for_input_release(void)
+{
+    bool any_held;
+    uint8_t i;
+    do {
+        poll_input();
+        any_held = false;
+        // Keycodes 0-3 in keystates[0] are status bits, not real keys:
+        //   0 = "no key pressed" indicator (always 1 when idle!)
+        //   1 = Num Lock on, 2 = Caps Lock on, 3 = Scroll Lock on
+        // Only check bits 4-7 of the first byte (keycodes 4-7 = a/b/c/d).
+        if (keystates[0] & 0xF0) { any_held = true; }
+        for (i = 1; i < KEYBOARD_BYTES; i++) {
+            if (keystates[i]) { any_held = true; break; }
+        }
+        if (!any_held) {
+            for (i = 0; i < GAMEPAD_COUNT; i++) {
+                // DPAD bits 0-3 are real directions; bits 4-7 are status/reserved.
+                if ((gamepad[i].dpad & 0x0F) ||
+                    gamepad[i].sticks ||
+                    gamepad[i].btn0   ||
+                    gamepad[i].btn1) {
+                    any_held = true;
+                    break;
+                }
+            }
+        }
+    } while (any_held);
+}
+
